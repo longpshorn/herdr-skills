@@ -7,14 +7,14 @@ Use the [minimal example](../minimal/README.md) instead when one person runs a f
 | Practice | Why | Files |
 | - | - | - |
 | Profile | Tells the herdr skills the forge, tracker, worktree commands, dev server, and what every brief must say. | `.claude/herdr-profile.json` |
-| Worktrees | Each agent gets its own checkout, bootstrapped, with its own port, so parallel agents never share a dev server. `new` is safe to re-run; `remove` refuses uncommitted work and keeps the branch. | `scripts/worktree.mjs`, `scripts/lib/worktree.mjs` |
+| Worktrees | Each agent gets its own checkout, bootstrapped, with its own port, so parallel agents never share a dev server. `new` is safe to re-run; `remove` refuses uncommitted work and keeps the branch, so `.gitignore` must hide the `.env.local` that bootstrap writes. | `scripts/worktree.mjs`, `scripts/lib/worktree.mjs`, `scripts/bootstrap.mjs`, `.gitignore` |
 | Agent rules | The lifecycle every agent follows: test first, never merge, rebase and hand over, run the doc check. | `CLAUDE.md` |
 | Stop hook | Runs `npm run check` before an agent may finish with changed files; a failure sends it back with the output. | `.claude/settings.json`, `.claude/hooks/verify-on-stop.mjs` |
 | One owner per shared concept | A registry names each shared rule's owner; the check fails when another file re-lists its values. | `docs/shared-concepts.md`, `scripts/lib/shared-concepts.mjs` |
 | Docs stay true | Doc parity fails the build when a doc names a script or file that doesn't exist; `npm run docs:impact` lists the docs a change may have made untrue; the template records each one under "Docs reviewed". | `scripts/lib/doc-parity.mjs`, `scripts/docs-impact.mjs`, `scripts/lib/docs-impact.mjs`, `.gitlab/merge_request_templates/Default.md`, `.github/pull_request_template.md` |
 | Personal install | `npm run bootstrap` installs the herdr plugin into each developer's own Claude Code settings when it is missing. It keeps an existing `herdr-skills` marketplace (such as a local clone), and never touches the committed `.claude/settings.json`. | `scripts/bootstrap.mjs`, `scripts/lib/herdr-plugin.mjs` |
 
-Each `scripts/lib/*.mjs` has its tests next to it (`*.test.mjs`). The shared-concepts and doc-parity tests also run against this repo itself, which is what makes `npm run check` fail on drift.
+Each `scripts/lib/*.mjs` has its tests next to it (`*.test.mjs`). Some pieces lean on others (docs-impact reads the file list from `scripts/lib/shared-concepts.mjs`, bootstrap writes `.env.local` through `scripts/lib/worktree.mjs`), so when you copy one by hand, copy what it imports; `/herdr:setup` does that for you. The shared-concepts and doc-parity tests also run against this repo itself, which is what makes `npm run check` fail on drift.
 
 ## Commands
 
