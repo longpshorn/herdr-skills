@@ -89,7 +89,7 @@ The plugin works on any repo, but much of what makes parallel agents safe lives 
 
 ## Development
 
-The skills are short; their deterministic parts live in `herdr/scripts/herdr_tools.py` (Python 3.9, no dependencies). CI runs its unit tests and the full example's tests on Linux, macOS and Windows:
+The skills are short; their deterministic parts live in `herdr/scripts/herdr_tools.py` (Python 3.9, no dependencies). CI runs its unit tests and the full example's tests on Linux, macOS and Windows. Linux is pinned to Ubuntu 24.04, because Python 3.9 has no Ubuntu 26.04 build:
 
 ```bash
 python3 -m unittest discover -s herdr/scripts -p 'test_*.py'
