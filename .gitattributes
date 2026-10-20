@@ -1,0 +1,2 @@
+# Scripts and fixtures stay LF on every OS: sh rejects CRLF, and tests compare text.
+* text=auto eol=lf

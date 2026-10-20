@@ -1,0 +1,11 @@
+#!/bin/sh
+# Run herdr_tools.py with the first Python 3.9 or later this machine has: `python3`, `python`, or the Windows
+# launcher `py -3`. Windows ships a `python3` stub that only opens the Store, so each one is tried, not just found.
+dir=$(dirname "$0")
+for python in python3 python "py -3"; do
+  if $python -c 'import sys; sys.exit(sys.version_info < (3, 9))' >/dev/null 2>&1; then
+    exec $python "$dir/herdr_tools.py" "$@"
+  fi
+done
+echo "herdr-tools: no Python 3.9 or later found (tried python3, python, py -3). Install one and put it on PATH." >&2
+exit 127

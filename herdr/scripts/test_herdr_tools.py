@@ -2,6 +2,8 @@
 import json
 import os
 import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -1068,6 +1070,49 @@ class LandQueue(unittest.TestCase):
             {"agent": "b", "result": "conflict", "detail": "still conflicts"},
         ])
         self.assertEqual(lines.splitlines(), ["a: merged (!3 merged as c0ffee12)", "b: conflict (still conflicts)"])
+
+
+WRAPPER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "herdr-tools")
+
+
+@unittest.skipUnless(shutil.which("sh"), "needs sh (Git Bash on Windows)")
+class Wrapper(unittest.TestCase):
+    """The skills run the helper through `sh herdr-tools`, which finds a Python 3.9+ under any of its usual names."""
+
+    def run_wrapper(self, path=None):
+        env = dict(os.environ)
+        if path is not None:
+            env["PATH"] = path
+        return subprocess.run([shutil.which("sh"), WRAPPER, "--help"], capture_output=True, text=True, env=env)
+
+    def test_runs_the_helper(self):
+        proc = self.run_wrapper()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("herdr_tools.py", proc.stdout)
+
+    def fake_bin(self, scripts):
+        """A folder holding only `dirname` and the given fake commands, so no real Python is on PATH."""
+        folder = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, folder, ignore_errors=True)
+        os.symlink(shutil.which("dirname"), os.path.join(folder, "dirname"))
+        for name, body in scripts.items():
+            with open(os.path.join(folder, name), "w") as handle:
+                handle.write("#!/bin/sh\n" + body + "\n")
+            os.chmod(os.path.join(folder, name), 0o755)
+        return folder
+
+    @unittest.skipIf(os.name == "nt", "fake commands on PATH are POSIX scripts")
+    def test_skips_a_python3_that_does_not_run_and_uses_python(self):
+        folder = self.fake_bin({"python3": "exit 9009", "python": 'exec "%s" "$@"' % sys.executable})
+        proc = self.run_wrapper(folder)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("herdr_tools.py", proc.stdout)
+
+    @unittest.skipIf(os.name == "nt", "fake commands on PATH are POSIX scripts")
+    def test_says_what_it_tried_when_there_is_no_python(self):
+        proc = self.run_wrapper(self.fake_bin({"python3": "exit 9009"}))
+        self.assertEqual(proc.returncode, 127)
+        self.assertIn("python3, python, py -3", proc.stderr)
 
 
 class Shareable(unittest.TestCase):

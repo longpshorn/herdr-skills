@@ -40,7 +40,8 @@
       The project's resolved profile: the repo's .claude/herdr-profile.json, with a personal overlay from
       ~/.config/herdr/profiles/ (matched by origin URL or path) laid over it, over the defaults.
 
-Python 3.9 compatible (the macOS Command Line Tools python3).
+Python 3.9 compatible (the macOS Command Line Tools python3). The skills run it through `sh herdr-tools`, which finds
+a Python 3.9+ as `python3`, `python` or `py -3`.
 """
 import argparse
 import fnmatch
