@@ -1332,7 +1332,9 @@ class GitHubMerge(unittest.TestCase):
         self.worktree = os.path.join(tempfile.mkdtemp(), "wt")
         self.addCleanup(shutil.rmtree, os.path.dirname(self.worktree), ignore_errors=True)
         run("worktree", "add", "-q", "-b", "feat/x", self.worktree)
-        self.gh_calls, self.delete_fails, self.fail_merge = [], False, False
+        self.gh_calls, self.delete_fails, self.fail_merge, self.sleeps = [], False, False, []
+        self.deletes = []  # (returncode, stderr) per DELETE, in order; then delete_fails decides
+        self.ref_check = (1, "gh: Unprocessable Entity (HTTP 422)")
         real_run = subprocess.run
         def fake_run(args, **kw):
             if args[0] != "gh":
@@ -1344,6 +1346,11 @@ class GitHubMerge(unittest.TestCase):
                 return subprocess.CompletedProcess(args, 0, out, "")
             if args[1:3] == ["pr", "merge"] and self.fail_merge:
                 return subprocess.CompletedProcess(args, 1, "", "Pull request is not mergeable")
+            if args[1] == "api" and "DELETE" in args and self.deletes:
+                code, err = self.deletes.pop(0)
+                return subprocess.CompletedProcess(args, code, "", err)
+            if args[1] == "api" and "DELETE" not in args:
+                return subprocess.CompletedProcess(args, self.ref_check[0], "", self.ref_check[1])
             if args[1] == "api" and self.delete_fails:
                 return subprocess.CompletedProcess(args, 1, "", "gh: Reference does not exist (HTTP 422)")
             return subprocess.CompletedProcess(args, 0, "", "")
@@ -1352,6 +1359,9 @@ class GitHubMerge(unittest.TestCase):
 
     def gh(self, *prefix):
         return [c for c in self.gh_calls if c[1:1 + len(prefix)] == list(prefix)]
+
+    def forge(self, repo=None):
+        return ht.GitHubForge(self.main, repo, sleep=self.sleeps.append)
 
     def test_leaves_the_worktree_and_local_branch_for_retire(self):
         result = ht.GitHubForge(self.main).merge(4, "abc")
@@ -1375,11 +1385,42 @@ class GitHubMerge(unittest.TestCase):
 
     def test_a_failed_remote_delete_is_a_warning_after_the_merge(self):
         self.delete_fails = True
+        self.ref_check = (0, "")
         with contextlib.redirect_stderr(io.StringIO()) as err:
-            result = ht.GitHubForge(self.main).merge(4, "abc")
-        self.assertEqual(result["state"], "merged")
+            result = self.forge().merge(4, "abc")
+        self.assertEqual(result, {"state": "merged", "commit": "m1", "url": "https://github.com/o/r/pull/4"})
         self.assertIn("feat/x", err.getvalue())
         self.assertIn("Reference does not exist", err.getvalue())
+        self.assertEqual(len(self.gh("api", "-X", "DELETE")), 2)
+        self.assertEqual(self.sleeps, [ht.DELETE_RETRY_SECONDS])
+
+    def test_a_transient_422_is_retried_once_after_a_short_wait(self):
+        self.deletes = [(1, "gh: Reference does not exist (HTTP 422)"), (0, "")]
+        self.ref_check = (0, "")
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            self.forge("o/r").merge(4, "abc")
+        self.assertEqual(err.getvalue(), "")
+        self.assertEqual(len(self.gh("api", "-X", "DELETE")), 2)
+        self.assertEqual(self.sleeps, [ht.DELETE_RETRY_SECONDS])
+        self.assertIn(["gh", "api", "repos/o/r/git/ref/heads/feat/x"], self.gh("api"))
+
+    def test_a_branch_already_gone_is_success_without_waiting(self):
+        self.deletes = [(1, "gh: Reference does not exist (HTTP 422)")]
+        self.ref_check = (1, "gh: Not Found (HTTP 404)")
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            self.forge().merge(4, "abc")
+        self.assertEqual(err.getvalue(), "")
+        self.assertEqual(len(self.gh("api", "-X", "DELETE")), 1)
+        self.assertEqual(self.sleeps, [])
+
+    def test_a_failed_ref_check_counts_as_the_branch_may_still_exist(self):
+        self.deletes = [(1, "gh: Server Error (HTTP 502)"), (0, "")]
+        self.ref_check = (1, "gh: Server Error (HTTP 502)")
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            self.forge().merge(4, "abc")
+        self.assertEqual(err.getvalue(), "")
+        self.assertEqual(len(self.gh("api", "-X", "DELETE")), 2)
+        self.assertEqual(self.sleeps, [ht.DELETE_RETRY_SECONDS])
 
     def test_a_failed_merge_raises_and_deletes_nothing(self):
         self.fail_merge = True
