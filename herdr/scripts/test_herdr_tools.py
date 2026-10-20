@@ -1,4 +1,6 @@
 """Tests for herdr_tools: its pure logic, and its herdr flows against a stubbed `herdr`. Run: python3 -m unittest discover -s <this dir> -p 'test_*.py'"""
+import contextlib
+import io
 import json
 import os
 import shutil
@@ -1290,6 +1292,74 @@ class GitHubNormalization(unittest.TestCase):
         self.assertEqual(self.action(mergeStateStatus="BLOCKED"), "stop")
         self.assertEqual(self.action(state="CLOSED"), "stop")
         self.assertEqual(self.action(state="MERGED"), "done")
+
+
+class GitHubMerge(unittest.TestCase):
+    """Landing a PR leaves the agent's local branch and worktree to retire (gh's --delete-branch removes both), and
+    deletes only the remote branch. Real git; `gh` is stubbed."""
+
+    def setUp(self):
+        self.main, run = git_repo(self)
+        write(self.main, "a.txt", "a\n")
+        run("add", "a.txt")
+        run("commit", "-q", "-m", "a")
+        self.worktree = os.path.join(tempfile.mkdtemp(), "wt")
+        self.addCleanup(shutil.rmtree, os.path.dirname(self.worktree), ignore_errors=True)
+        run("worktree", "add", "-q", "-b", "feat/x", self.worktree)
+        self.gh_calls, self.delete_fails, self.fail_merge = [], False, False
+        real_run = subprocess.run
+        def fake_run(args, **kw):
+            if args[0] != "gh":
+                return real_run(args, **kw)
+            self.gh_calls.append(args)
+            if args[1:3] == ["pr", "view"]:
+                out = json.dumps({"state": "MERGED", "url": "https://github.com/o/r/pull/4",
+                                  "mergeCommit": {"oid": "m1"}, "headRefName": "feat/x"})
+                return subprocess.CompletedProcess(args, 0, out, "")
+            if args[1:3] == ["pr", "merge"] and self.fail_merge:
+                return subprocess.CompletedProcess(args, 1, "", "Pull request is not mergeable")
+            if args[1] == "api" and self.delete_fails:
+                return subprocess.CompletedProcess(args, 1, "", "gh: Reference does not exist (HTTP 422)")
+            return subprocess.CompletedProcess(args, 0, "", "")
+        ht.subprocess.run = fake_run
+        self.addCleanup(setattr, ht.subprocess, "run", real_run)
+
+    def gh(self, *prefix):
+        return [c for c in self.gh_calls if c[1:1 + len(prefix)] == list(prefix)]
+
+    def test_leaves_the_worktree_and_local_branch_for_retire(self):
+        result = ht.GitHubForge(self.main).merge(4, "abc")
+        self.assertEqual(result, {"state": "merged", "commit": "m1", "url": "https://github.com/o/r/pull/4"})
+        self.assertTrue(os.path.isdir(self.worktree))
+        listed = [os.path.realpath(line[len("worktree "):]) for line in
+                  ht.git(self.main, "worktree", "list", "--porcelain")[1].splitlines() if line.startswith("worktree ")]
+        self.assertIn(os.path.realpath(self.worktree), listed)
+        self.assertEqual(ht.git(self.main, "rev-parse", "--verify", "-q", "refs/heads/feat/x")[0], 0)
+        merge = self.gh("pr", "merge")[0]
+        self.assertNotIn("--delete-branch", merge)
+        self.assertEqual(merge[merge.index("--match-head-commit") + 1], "abc")
+
+    def test_deletes_only_the_remote_branch(self):
+        ht.GitHubForge(self.main).merge(4, "abc")
+        self.assertEqual(self.gh("api"), [["gh", "api", "-X", "DELETE", "repos/{owner}/{repo}/git/refs/heads/feat/x"]])
+
+    def test_a_pr_in_another_repo_deletes_that_repos_branch(self):
+        ht.GitHubForge(self.main, "o/r").merge(4, "abc")
+        self.assertEqual(self.gh("api")[0][-1], "repos/o/r/git/refs/heads/feat/x")
+
+    def test_a_failed_remote_delete_is_a_warning_after_the_merge(self):
+        self.delete_fails = True
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            result = ht.GitHubForge(self.main).merge(4, "abc")
+        self.assertEqual(result["state"], "merged")
+        self.assertIn("feat/x", err.getvalue())
+        self.assertIn("Reference does not exist", err.getvalue())
+
+    def test_a_failed_merge_raises_and_deletes_nothing(self):
+        self.fail_merge = True
+        with self.assertRaisesRegex(ht.HerdrError, "gh pr merge failed"):
+            ht.GitHubForge(self.main).merge(4, "abc")
+        self.assertEqual(self.gh("api"), [])
 
 
 class ReportFollowups(unittest.TestCase):
