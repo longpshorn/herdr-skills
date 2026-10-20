@@ -3,7 +3,11 @@ name: retry unacquired
 # A hosted runner can fail to pick up a job at all ("not acquired by Runner"),
 # most often on macOS arm64 when GitHub is short of capacity. The job is then
 # cancelled before it starts, and timeout-minutes doesn't apply to queue time.
-# Re-run such a test run, at most twice; real failures are never retried.
+# When every failed job is one of these, re-run those jobs (at most twice per
+# run). When any job failed on a runner, retry nothing: that run fails anyway,
+# and a retry could hide a flaky failure. All the jobs go in one re-run, because
+# re-running a single job starts a new attempt and GitHub then refuses to re-run
+# the other jobs from the earlier one.
 
 on:
   workflow_run:
@@ -26,12 +30,21 @@ jobs:
     steps:
       - name: Re-run jobs that never got a runner
         run: |
-          unacquired=$(gh api "repos/$GH_REPO/actions/runs/$RUN_ID/attempts/$ATTEMPT/jobs" --paginate \
-            --jq '.jobs[] | select(.conclusion == "cancelled" and (.runner_name // "") == "") | .name')
+          jobs=$(gh api "repos/$GH_REPO/actions/runs/$RUN_ID/attempts/$ATTEMPT/jobs" --paginate --slurp)
+          unacquired=$(jq -r '.[].jobs[] | select(.conclusion == "cancelled" and (.runner_name // "") == "") | .name' <<<"$jobs")
+          failed_on_runner=$(jq -r '.[].jobs[]
+            | select((.conclusion // "success") | IN("success", "skipped", "neutral") | not)
+            | select((.runner_name // "") != "") | .name' <<<"$jobs")
           if [ -z "$unacquired" ]; then
             echo "No job went unacquired; nothing to retry."
             exit 0
           fi
           echo "Never got a runner:"
           echo "$unacquired"
+          if [ -n "$failed_on_runner" ]; then
+            echo "Failed on a runner, so nothing is retried:"
+            echo "$failed_on_runner"
+            exit 0
+          fi
+          # Every failed job is an unacquired one, so --failed re-runs exactly those.
           gh run rerun "$RUN_ID" --failed
