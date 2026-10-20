@@ -22,6 +22,10 @@
       Merge the agent's validated MR (its worktree branch's, else the one its status report names), or the MR --mr
       names in any repo: rebase if behind, wait for the head pipeline, squash-merge pinned to that commit. Stops on a
       draft, conflicts, unresolved threads, a failed pipeline or a missing approval.
+  herdr_tools.py land AGENT AGENT... [--max-hours 3] [--timeout-minutes 30]
+      Land several agents' MRs in this order. An agent whose MR conflicts is asked once to rebase and retried after
+      the others until --max-hours; any other refusal fails that agent. Prints one line per agent; exits 1 unless
+      all merged.
   herdr_tools.py watch AGENT... [--max-hours 4] [--poll-seconds 120]
       Watch the agents' status reports and land the first one that is ready (MR open, pipeline passed, "ready to
       land", no open questions), then exit. An agent whose MR conflicts is asked once to rebase; an MR waiting on an
@@ -32,11 +36,15 @@
   herdr_tools.py main-server start|restart|status --path REPO [--command CMD]
       Run the main checkout's dev server (its profile's dev_server.command) in a Herdr pane labelled
       "main dev server", restart it, or report it.
+  herdr_tools.py setup-scan --path REPO
+      For /herdr:setup (and outside Herdr too): the repo's forge, a tracker guessed from its ticket keys, its package
+      manager, which practices from examples/full it has, and a proposed profile when it has none.
   herdr_tools.py profile --path REPO
       The project's resolved profile: the repo's .claude/herdr-profile.json, with a personal overlay from
       ~/.config/herdr/profiles/ (matched by origin URL or path) laid over it, over the defaults.
 
-Python 3.9 compatible (the macOS Command Line Tools python3).
+Python 3.9 compatible (the macOS Command Line Tools python3). The skills run it through `sh herdr-tools`, which finds
+a Python 3.9+ as `python3`, `python` or `py -3`.
 """
 import argparse
 import fnmatch
@@ -177,10 +185,27 @@ def approval_detail(approval):
     return "needs %d approval%s from someone other than its author" % (left, "" if left == 1 else "s")
 
 
+def head_landed_how(head, mr_sha, on_default, branch_patch, merged_patch):
+    """How the worktree's HEAD landed, or None when it didn't. land rebases an MR that is behind before merging, so
+    the merged commit is usually not HEAD; the same patch (`git patch-id --stable`) then shows nothing was lost."""
+    if head and head == mr_sha:
+        return "same commit"
+    if on_default:
+        return "on the default branch"
+    if branch_patch and branch_patch == merged_patch:
+        return "same patch"
+    return None
+
+
+def merged_commit(mr):
+    """The commit a merged MR or PR put on its target: GitLab's squash or merge commit, or GitHub's merge commit."""
+    return mr.get("squash_commit_sha") or mr.get("merge_commit_sha")
+
+
 def retire_checks(agent_status, porcelain, mr_state, head_landed, report, worktree_removed=False, approval=None):
     """Every check /herdr:retire reports, in order. The workspace may be retired only when all are ok.
 
-    head_landed: the worktree's HEAD is the commit the MR merged, or is already on origin/main.
+    head_landed: how the worktree's HEAD landed (see head_landed_how), or a falsy value when it did not.
     worktree_removed: the worktree folder is already gone, so nothing local can be lost; the agent's report still gates.
     approval: an open MR's approval state (gitlab_approval's shape); None when there is no open MR to approve.
     """
@@ -203,8 +228,10 @@ def retire_checks(agent_status, porcelain, mr_state, head_landed, report, worktr
             check("merged", mr_state == "merged", "MR is %s" % (mr_state or "not found")),
             check(
                 "head",
-                head_landed,
-                "HEAD is the merged commit or on origin/main" if head_landed else "HEAD has commits the merge did not take",
+                bool(head_landed),
+                ("HEAD landed: %s" % head_landed if isinstance(head_landed, str) else
+                 "HEAD is the merged commit or on origin/main") if head_landed else
+                "HEAD has commits the merge did not take",
             ),
         ]
     if approval is None:
@@ -332,6 +359,132 @@ def load_profile(main_checkout, remote_url, overlay_dir=OVERLAY_DIR):
     return profile, sources
 
 
+# ---- /herdr:setup: what a repo has, and what it lacks ------------------------------------------------------------
+# Each practice the examples/full sample repo shows: why it matters, and the files to copy from it.
+
+PRACTICES = [
+    ("worktree", "A worktree command gives each agent its own checkout, bootstrapped, with its own ports, so parallel "
+                 "agents never share a dev server or node_modules.",
+     ["scripts/worktree.mjs", "scripts/lib/worktree.mjs", "scripts/lib/worktree.test.mjs"]),
+    ("agent_lifecycle", "Agents follow the repo's CLAUDE.md: test first, never merge, rebase and hand over, run the "
+                        "doc check. Without it each agent improvises its own process.",
+     ["CLAUDE.md"]),
+    ("stop_hook", "A Stop hook runs the project's checks before an agent may finish, so it can't hand over red work.",
+     [".claude/settings.json", ".claude/hooks/verify-on-stop.mjs", "scripts/lib/stop-hook.test.mjs"]),
+    ("shared_concepts", "A registry gives each shared rule or value set one owner, and its check fails when another "
+                        "file re-lists the values. Parallel agents otherwise each build their own copy.",
+     ["docs/shared-concepts.md", "scripts/lib/shared-concepts.mjs", "scripts/lib/shared-concepts.test.mjs"]),
+    ("doc_checks", "A doc-parity check fails the build when docs name commands or files that no longer exist, and "
+                   "docs-impact lists the docs a change may have made untrue.",
+     ["scripts/lib/doc-parity.mjs", "scripts/lib/doc-parity.test.mjs", "scripts/docs-impact.mjs",
+      "scripts/lib/docs-impact.mjs", "scripts/lib/docs-impact.test.mjs"]),
+    ("mr_template", "An MR or PR template with a \"Docs reviewed\" section makes the agent record each doc it reread.",
+     None),
+    ("personal_install", "Bootstrap installs the herdr plugin into each developer's own settings when it is missing, "
+                         "never into the project's committed settings.",
+     ["scripts/bootstrap.mjs", "scripts/lib/herdr-plugin.mjs", "scripts/lib/herdr-plugin.test.mjs"]),
+]
+MR_TEMPLATE = {"github": ".github/pull_request_template.md", "gitlab": ".gitlab/merge_request_templates/Default.md"}
+MR_TEMPLATE_GLOBS = [".gitlab/merge_request_templates/*.md", ".github/pull_request_template.md",
+                     ".github/PULL_REQUEST_TEMPLATE.md", ".github/PULL_REQUEST_TEMPLATE/*.md",
+                     "docs/pull_request_template.md", "pull_request_template.md"]
+LOCKFILES = [("pnpm-lock.yaml", "pnpm"), ("yarn.lock", "yarn"), ("bun.lock", "bun"), ("bun.lockb", "bun"),
+             ("package-lock.json", "npm"), ("package.json", "npm"), ("uv.lock", "uv"), ("poetry.lock", "poetry"),
+             ("pyproject.toml", "pip"), ("requirements.txt", "pip"), ("go.mod", "go"), ("Cargo.toml", "cargo")]
+RUN_SCRIPT = {"npm": "npm run %s", "pnpm": "pnpm %s", "yarn": "yarn %s", "bun": "bun run %s"}
+TICKET_KEY = re.compile(r"\b([A-Z][A-Z0-9]+)-\d+\b")
+
+
+def setup_scan(path, remote, history):
+    """What /herdr:setup proposes for the repo at PATH: its forge (from the origin URL), a tracker guessed from ticket
+    keys in HISTORY (branch names and commit subjects), its package manager, each practice from examples/full with
+    whether the repo has it, and a profile from the closest example (None when the repo has one)."""
+    def read(name):
+        try:
+            with open(os.path.join(path, name), encoding="utf-8", errors="replace") as handle:
+                return handle.read()
+        except OSError:
+            return None
+
+    def files_under(*folders):
+        for folder in folders:
+            for root, dirs, names in os.walk(os.path.join(path, folder)):
+                dirs[:] = [d for d in dirs if d not in ("node_modules", ".git")]
+                for name in names:
+                    yield os.path.relpath(os.path.join(root, name), path).replace(os.sep, "/")
+
+    def json_file(name):
+        try:
+            return json.loads(read(name) or "{}")
+        except ValueError:
+            return {}
+
+    forge = forge_from_remote(remote)
+    keys = {}
+    for line in history:
+        for key in set(TICKET_KEY.findall(line)):
+            keys[key] = keys.get(key, 0) + 1
+    project = max(keys, key=lambda k: keys[k]) if keys else None
+    tracker = {"kind": "jira", "project": project} if project and keys[project] >= 2 else None
+    manager = next((pm for name, pm in LOCKFILES if os.path.isfile(os.path.join(path, name))), None)
+    scripts = json_file("package.json").get("scripts") or {}
+    settings = json_file(os.path.join(".claude", "settings.json"))
+    script_files = list(files_under("scripts", "bin"))
+    top_files = [n for n in os.listdir(path) if os.path.isfile(os.path.join(path, n))]
+    guide = (read("CLAUDE.md") or "") + (read("AGENTS.md") or "")
+    templates = [n for n in list(files_under(".gitlab", ".github", "docs")) + top_files
+                 if any(fnmatch.fnmatch(n, g) for g in MR_TEMPLATE_GLOBS)]
+    installers = [n for n in script_files + top_files
+                  if not n.endswith(".md") and "herdr@herdr-skills" in (read(n) or "")]  # docs only describe it
+
+    present = {
+        "worktree": any("worktree" in s for s in scripts) or any("worktree" in n.lower() for n in script_files)
+                    or bool(re.search(r"(?m)^worktree[\w-]*:", read("Makefile") or "")),
+        "agent_lifecycle": bool(re.search(r"(?im)^#{1,6} .*lifecycle", guide)),
+        "stop_hook": bool((settings.get("hooks") or {}).get("Stop")),
+        "shared_concepts": os.path.isfile(os.path.join(path, "docs", "shared-concepts.md")),
+        "doc_checks": any(s.startswith("docs") for s in scripts)
+                      or any(re.search(r"doc-parity|docs-impact", n) for n in script_files),
+        "mr_template": any("docs reviewed" in (read(n) or "").lower() for n in templates),
+        "personal_install": bool(installers),
+    }
+    evidence = {"mr_template": "templates: %s" % ", ".join(templates) if templates else "no template",
+                "personal_install": ", ".join(installers)}
+    practices = [{"practice": name, "present": present[name], "why": why,
+                  "copy": copy or [MR_TEMPLATE.get(forge or "github", MR_TEMPLATE["github"])],
+                  "evidence": evidence.get(name, "")} for name, why, copy in PRACTICES]
+    plugins = settings.get("enabledPlugins") or {}
+    in_settings = any(k.startswith("herdr@") for k in plugins) or "herdr-skills" in (settings.get(
+        "extraKnownMarketplaces") or {})
+
+    profile_path = os.path.join(path, REPO_PROFILE)
+    proposed = None
+    if not os.path.isfile(profile_path):
+        proposed = {"name": os.path.basename(os.path.abspath(path)), "forge": forge}
+        if tracker:
+            proposed["tracker"] = dict(tracker)
+        run = RUN_SCRIPT.get(manager)
+        if run and "worktree" in scripts:
+            proposed["worktree"] = {"new": run % "worktree new {branch}", "remove": run % "worktree remove {branch}"}
+        dev = next((s for s in ("dev", "start") if s in scripts), None)
+        if run and dev:
+            proposed["dev_server"] = {"command": run % dev}
+    return {
+        "path": os.path.abspath(path), "remote": remote, "forge": forge, "tracker": tracker,
+        "package_manager": manager, "profile": profile_path if proposed is None else None,
+        "closest_example": "full" if tracker or forge == "gitlab" else "minimal",
+        "proposed_profile": proposed, "plugin_in_committed_settings": in_settings, "practices": practices,
+    }
+
+
+def scan_repo(path):
+    """setup_scan for the repo PATH is in, with its origin URL and the ticket keys its branches and commits use."""
+    root = repo_root(path)
+    history = git(root, "for-each-ref", "--format=%(refname:short)", "refs/heads", "refs/remotes")[1].splitlines()
+    history += git(root, "log", "-200", "--format=%s")[1].splitlines()
+    return setup_scan(root, git(root, "remote", "get-url", "origin")[1], history)
+
+
 def github_pr_to_mr(pr):
     """A `gh pr view --json` result in the shape land_decision reads (GitLab's merge-request fields)."""
     sha = pr.get("headRefOid")
@@ -366,6 +519,7 @@ def github_pr_to_mr(pr):
         "blocking_discussions_resolved": True,
         "detailed_merge_status": merge_state,
         "head_pipeline": {"status": pipeline, "sha": sha},
+        "merge_commit_sha": (pr.get("mergeCommit") or {}).get("oid"),
     }
 
 
@@ -611,6 +765,27 @@ def git(path, *args):
     return proc.returncode, proc.stdout.strip()
 
 
+def patch_id(path, diff_args):
+    """`git patch-id --stable` of a diff, or None when the diff fails or is empty. Bytes throughout: a patch need not
+    be valid text in the locale's encoding."""
+    diff = subprocess.run(["git", "-C", path, *diff_args], capture_output=True)
+    if diff.returncode != 0 or not diff.stdout.strip():
+        return None
+    out = subprocess.run(["git", "-C", path, "patch-id", "--stable"], input=diff.stdout, capture_output=True).stdout
+    return out.split()[0].decode() if out.split() else None
+
+
+def branch_patch_id(path, default):
+    """The patch of everything the branch at PATH adds since it left DEFAULT."""
+    code, base = git(path, "merge-base", "HEAD", default)
+    return patch_id(path, ["diff", "--no-color", base, "HEAD"]) if code == 0 else None
+
+
+def commit_patch_id(path, commit):
+    """The patch COMMIT applied to its first parent: a squash commit's whole change, or a merge commit's branch."""
+    return patch_id(path, ["diff", "--no-color", commit + "^1", commit])
+
+
 def project_profile(main_checkout):
     """The resolved profile for the repo whose main checkout this is (see resolve_profile)."""
     remote = git(main_checkout, "remote", "get-url", "origin")[1]
@@ -668,7 +843,8 @@ class GitHubForge:
     """Pull requests through gh, normalized to the merge-request shape land_decision reads. With a repo (a PR named by
     URL) every call names it; without one gh resolves it from the main checkout."""
 
-    FIELDS = "number,state,url,headRefOid,isDraft,mergeable,mergeStateStatus,statusCheckRollup,reviewDecision"
+    FIELDS = ("number,state,url,headRefOid,isDraft,mergeable,mergeStateStatus,statusCheckRollup,reviewDecision,"
+              "mergeCommit")
 
     def __init__(self, main_checkout, repo=None):
         self.main = main_checkout
@@ -762,11 +938,18 @@ def retire_info(target):
     profile = project_profile(main_checkout)
     looks_like_branch = bool(branch) and " " not in branch
     mr, forge = resolve_mr(forge_for(profile), branch if looks_like_branch else None, report, main_checkout)
-    approval = forge.view(mr["iid"])[0]["approvals"] if mr and mr["state"] == "opened" else None
+    viewed = forge.view(mr["iid"])[0] if mr and mr["state"] in ("opened", "merged") else {}
+    approval = viewed["approvals"] if mr and mr["state"] == "opened" else None
     if not removed:
         default = git(main_checkout, "symbolic-ref", "--short", "refs/remotes/origin/HEAD")[1] or "origin/main"
         on_default = git(path, "merge-base", "--is-ancestor", "HEAD", default)[0] == 0
-        head_landed = on_default or bool(mr and mr.get("sha") == head)
+        branch_patch = merged_patch = None
+        merged = merged_commit(viewed)
+        if not on_default and merged and head != (mr or {}).get("sha"):
+            if git(path, "cat-file", "-e", merged + "^{commit}")[0] != 0:
+                git(main_checkout, "fetch", "-q", "origin", merged)
+            branch_patch, merged_patch = branch_patch_id(path, default), commit_patch_id(path, merged)
+        head_landed = head_landed_how(head, (mr or {}).get("sha"), on_default, branch_patch, merged_patch)
     return {
         "profile": profile["name"] or "(defaults)",
         "forge": profile["forge"],
@@ -874,6 +1057,49 @@ def watch(agents, max_hours=4.0, poll_seconds=120):
     return watch_loop(
         agents, land, lambda agent, message: herdr("agent", "prompt", agent, message, parse=False),
         lambda agent: read_report(agent)[1], max_hours * 3600, poll_seconds)
+
+
+def land_queue(agents, land_fn, ask_fn, max_seconds, poll_seconds=300, sleep=time.sleep, now=time.time):
+    """Land each agent's MR in the given order. A conflicting MR's agent is asked once to rebase and retried after the
+    others until the deadline; any other refusal fails that agent. One result per agent, in the given order."""
+    results, pending, asked = {}, list(agents), set()
+    deadline = now() + max_seconds
+    while pending:
+        for agent in list(pending):
+            try:
+                landed = land_fn(agent)
+            except HerdrError as error:
+                reason = str(error).splitlines()[-1]
+                if "conflicts" not in reason:
+                    results[agent] = {"agent": agent, "result": "failed", "detail": reason}
+                    pending.remove(agent)
+                    continue
+                if agent not in asked:
+                    ask_fn(agent, REBASE_REQUEST)
+                    asked.add(agent)
+                results[agent] = {"agent": agent, "result": "conflict",
+                                  "detail": "asked to rebase; still conflicts: %s" % reason}
+                continue
+            commit = (landed.get("commit") or "")[:8]
+            results[agent] = {"agent": agent, "result": "merged", "detail": "!%s %s%s" % (
+                landed.get("iid"), "was already merged" if landed.get("already_merged") else "merged",
+                " as " + commit if commit else "")}
+            pending.remove(agent)
+        if not pending or now() >= deadline:
+            break
+        print("waiting on %s to rebase" % ", ".join(pending), file=sys.stderr, flush=True)
+        sleep(poll_seconds)
+    return [results[agent] for agent in agents]
+
+
+def format_land_results(results):
+    return "\n".join("%s: %s (%s)" % (r["agent"], r["result"], r["detail"]) for r in results)
+
+
+def land_several(agents, timeout_minutes=30, max_hours=3.0, poll_seconds=300):
+    return land_queue(
+        agents, lambda agent: land(agent, timeout_minutes),
+        lambda agent, message: herdr("agent", "prompt", agent, message, parse=False), max_hours * 3600, poll_seconds)
 
 
 def update_main(path):
@@ -1106,9 +1332,10 @@ def main(argv=None):
     ri = sub.add_parser("retire-info")
     ri.add_argument("target")
     la = sub.add_parser("land")
-    la.add_argument("target", nargs="?")
+    la.add_argument("targets", nargs="*", metavar="target", help="one agent, or several to land in this order")
     la.add_argument("--mr", help="the MR to land, by URL or group/project!iid, when it isn't the agent's branch's")
     la.add_argument("--timeout-minutes", type=int, default=30)
+    la.add_argument("--max-hours", type=float, default=3.0, help="with several agents: how long to wait for rebases")
     wa = sub.add_parser("watch")
     wa.add_argument("agents", nargs="+")
     wa.add_argument("--max-hours", type=float, default=4.0)
@@ -1121,11 +1348,20 @@ def main(argv=None):
     ms.add_argument("--command", dest="server_command", default=None)
     pf = sub.add_parser("profile")
     pf.add_argument("--path", required=True)
+    ss = sub.add_parser("setup-scan")
+    ss.add_argument("--path", required=True)
     sm = sub.add_parser("sync-mirrors")
     sm.add_argument("--path", required=True)
     sm.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
 
+    if args.command == "setup-scan":  # reads a repo only, so it also works outside Herdr
+        try:
+            print(json.dumps(scan_repo(args.path), indent=2))
+        except HerdrError as error:
+            print(str(error), file=sys.stderr)
+            return 1
+        return 0
     if os.environ.get("HERDR_ENV") != "1":
         print("Not running inside a Herdr-managed pane (HERDR_ENV != 1); refusing to control Herdr.", file=sys.stderr)
         return 2
@@ -1148,8 +1384,15 @@ def main(argv=None):
             print(path)
         elif args.command == "retire-info":
             print(json.dumps(retire_info(args.target), indent=2))
+        elif args.command == "land" and len(args.targets) > 1:
+            if args.mr:
+                raise HerdrError("--mr lands one MR; name several agents without it.")
+            results = land_several(args.targets, args.timeout_minutes, args.max_hours)
+            print(format_land_results(results))
+            return 0 if all(r["result"] == "merged" for r in results) else 1
         elif args.command == "land":
-            print(json.dumps(land(args.target, args.timeout_minutes, mr=args.mr), indent=2))
+            target = args.targets[0] if args.targets else None
+            print(json.dumps(land(target, args.timeout_minutes, mr=args.mr), indent=2))
         elif args.command == "watch":
             print(json.dumps(watch(args.agents, args.max_hours, args.poll_seconds), indent=2))
         elif args.command == "update-main":

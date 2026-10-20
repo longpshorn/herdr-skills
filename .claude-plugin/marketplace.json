@@ -7,7 +7,7 @@
   "plugins": [
     {
       "name": "herdr",
-      "description": "Herdr skills: /herdr:status, /herdr:spawn, /herdr:ask, /herdr:peek, /herdr:run, /herdr:retire",
+      "description": "Herdr skills: /herdr:setup, /herdr:status, /herdr:spawn, /herdr:ask, /herdr:peek, /herdr:run, /herdr:retire",
       "source": "./herdr"
     }
   ]

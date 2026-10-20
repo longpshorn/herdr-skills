@@ -2,6 +2,8 @@
 import json
 import os
 import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -176,16 +178,25 @@ class FakeAgentHerdr:
 
 
 class AgentHerdrTest(unittest.TestCase):
-    """Stubs `herdr` and git, and points HOME at a temporary directory for the saved-prompt files."""
+    """Stubs `herdr` and git, and points the home directory at a temporary one for the saved-prompt files (HOME, and
+    USERPROFILE, which is what expanduser reads on Windows)."""
+
+    HOME_VARS = ("HOME", "USERPROFILE")
 
     def setUp(self):
-        self.saved = ht.herdr, ht.repo_root, os.environ.get("HOME")
+        self.saved = ht.herdr, ht.repo_root, {name: os.environ.get(name) for name in self.HOME_VARS}
         ht.repo_root = lambda path: REPO
         self.home = tempfile.mkdtemp()
-        os.environ["HOME"] = self.home
+        for name in self.HOME_VARS:
+            os.environ[name] = self.home
 
     def tearDown(self):
-        ht.herdr, ht.repo_root, os.environ["HOME"] = self.saved
+        ht.herdr, ht.repo_root, env = self.saved
+        for name, value in env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
         shutil.rmtree(self.home)
 
     def use(self, fake):
@@ -200,7 +211,7 @@ class Launch(AgentHerdrTest):
     def test_lets_herdr_find_or_create_the_parent_from_the_main_checkout(self):
         fake = self.use(FakeAgentHerdr())
         self.launch()
-        self.assertEqual(fake.called("worktree", "open"), [("worktree", "open", "--cwd", REPO, "--path", REPO + "-TICKET-2",
+        self.assertEqual(fake.called("worktree", "open"), [("worktree", "open", "--cwd", REPO, "--path", os.path.abspath(REPO + "-TICKET-2"),
                                                             "--label", "TICKET-2 x", "--no-focus")])
         self.assertEqual(fake.called("workspace"), [])
 
@@ -516,7 +527,8 @@ None
 
 class StatusReportPath(unittest.TestCase):
     def test_lives_in_the_herdr_status_cache_named_after_the_agent(self):
-        self.assertEqual(ht.status_report_path("res1", home="/home/p"), "/home/p/.cache/herdr/status/res1.md")
+        self.assertEqual(ht.status_report_path("res1", home="/home/p"),
+                         os.path.join("/home/p", ".cache", "herdr", "status", "res1.md"))
 
 
 class ParseStatusReport(unittest.TestCase):
@@ -1015,6 +1027,215 @@ class WatchLoop(unittest.TestCase):
         self.assertEqual(self.asked, [])
 
 
+CONFLICT = ht.HerdrError("Not landing !3: MR has conflicts; the agent must resolve them.")
+
+
+class LandQueue(unittest.TestCase):
+    def run_queue(self, outcomes, max_seconds=10):
+        """outcomes: agent -> list of results per attempt (an exception is raised); the last one repeats."""
+        self.asked, self.calls = [], []
+        clock = {"t": 0}
+        def land_fn(agent):
+            self.calls.append(agent)
+            results = outcomes[agent]
+            item = results.pop(0) if len(results) > 1 else results[0]
+            if isinstance(item, Exception):
+                raise item
+            return item
+        def sleep(seconds):
+            clock["t"] += seconds
+        return ht.land_queue(list(outcomes), land_fn, lambda agent, message: self.asked.append((agent, message)),
+                             max_seconds=max_seconds, poll_seconds=1, sleep=sleep, now=lambda: clock["t"])
+
+    def test_lands_each_in_the_given_order(self):
+        merged = {"state": "merged", "iid": 3, "commit": "c0ffee12345"}
+        results = self.run_queue({"c": [merged], "a": [merged], "b": [merged]})
+        self.assertEqual(self.calls, ["c", "a", "b"])
+        self.assertEqual([(r["agent"], r["result"]) for r in results], [("c", "merged"), ("a", "merged"), ("b", "merged")])
+
+    def test_a_conflict_asks_the_agent_to_rebase_keeps_going_and_retries_it_at_the_end(self):
+        merged = {"state": "merged", "iid": 3}
+        results = self.run_queue({"a": [CONFLICT, merged], "b": [merged]})
+        self.assertEqual(self.calls, ["a", "b", "a"])
+        self.assertEqual([a for a, _ in self.asked], ["a"])
+        self.assertIn("rebase", self.asked[0][1].lower())
+        self.assertEqual([(r["agent"], r["result"]) for r in results], [("a", "merged"), ("b", "merged")])
+
+    def test_an_agent_still_conflicting_at_the_deadline_is_reported_and_asked_only_once(self):
+        results = self.run_queue({"a": [CONFLICT], "b": [{"state": "merged", "iid": 4}]}, max_seconds=3)
+        self.assertEqual([a for a, _ in self.asked], ["a"])
+        self.assertEqual({r["agent"]: r["result"] for r in results}, {"a": "conflict", "b": "merged"})
+
+    def test_any_other_refusal_fails_that_agent_without_retrying_it(self):
+        results = self.run_queue({"a": [ht.HerdrError("Not landing !3: head pipeline failed.")],
+                                  "b": [{"state": "merged", "iid": 4}]})
+        self.assertEqual(self.calls, ["a", "b"])
+        self.assertEqual(results[0]["result"], "failed")
+        self.assertIn("head pipeline failed", results[0]["detail"])
+        self.assertEqual(self.asked, [])
+
+    def test_one_line_per_agent(self):
+        lines = ht.format_land_results([
+            {"agent": "a", "result": "merged", "detail": "!3 merged as c0ffee12"},
+            {"agent": "b", "result": "conflict", "detail": "still conflicts"},
+        ])
+        self.assertEqual(lines.splitlines(), ["a: merged (!3 merged as c0ffee12)", "b: conflict (still conflicts)"])
+
+
+WRAPPER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "herdr-tools")
+
+
+@unittest.skipUnless(shutil.which("sh"), "needs sh (Git Bash on Windows)")
+class Wrapper(unittest.TestCase):
+    """The skills run the helper through `sh herdr-tools`, which finds a Python 3.9+ under any of its usual names."""
+
+    def run_wrapper(self, path=None):
+        env = dict(os.environ)
+        if path is not None:
+            env["PATH"] = path
+        return subprocess.run([shutil.which("sh"), WRAPPER, "--help"], capture_output=True, text=True, env=env)
+
+    def test_runs_the_helper(self):
+        proc = self.run_wrapper()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("herdr_tools.py", proc.stdout)
+
+    def fake_bin(self, scripts):
+        """A folder holding only `dirname` and the given fake commands, so no real Python is on PATH."""
+        folder = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, folder, ignore_errors=True)
+        os.symlink(shutil.which("dirname"), os.path.join(folder, "dirname"))
+        for name, body in scripts.items():
+            with open(os.path.join(folder, name), "w") as handle:
+                handle.write("#!/bin/sh\n" + body + "\n")
+            os.chmod(os.path.join(folder, name), 0o755)
+        return folder
+
+    @unittest.skipIf(os.name == "nt", "fake commands on PATH are POSIX scripts")
+    def test_skips_a_python3_that_does_not_run_and_uses_python(self):
+        folder = self.fake_bin({"python3": "exit 9009", "python": 'exec "%s" "$@"' % sys.executable})
+        proc = self.run_wrapper(folder)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("herdr_tools.py", proc.stdout)
+
+    @unittest.skipIf(os.name == "nt", "fake commands on PATH are POSIX scripts")
+    def test_says_what_it_tried_when_there_is_no_python(self):
+        proc = self.run_wrapper(self.fake_bin({"python3": "exit 9009"}))
+        self.assertEqual(proc.returncode, 127)
+        self.assertIn("python3, python, py -3", proc.stderr)
+
+
+class SetupScan(unittest.TestCase):
+    """What /herdr:setup reads off a repo: forge, tracker hints, package manager, and which practices it lacks."""
+
+    def repo(self, files):
+        path = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, path, ignore_errors=True)
+        for name, text in files.items():
+            os.makedirs(os.path.dirname(os.path.join(path, name)) or path, exist_ok=True)
+            write(path, name, text if isinstance(text, str) else json.dumps(text))
+        return path
+
+    def scan(self, files, remote="git@github.com:acme/app.git", history=()):
+        return ht.setup_scan(self.repo(files), remote, list(history))
+
+    def practices(self, result):
+        return {p["practice"]: p for p in result["practices"]}
+
+    def test_a_bare_github_repo_lacks_every_practice_and_gets_the_minimal_profile(self):
+        result = self.scan({"README.md": "# app\n"})
+        self.assertEqual(result["forge"], "github")
+        self.assertIsNone(result["tracker"])
+        self.assertEqual(result["closest_example"], "minimal")
+        self.assertEqual(result["proposed_profile"], {"name": os.path.basename(result["path"]), "forge": "github"})
+        practices = self.practices(result)
+        self.assertEqual(sorted(practices), sorted(["worktree", "agent_lifecycle", "stop_hook", "shared_concepts",
+                                                    "doc_checks", "mr_template", "personal_install"]))
+        self.assertFalse(any(p["present"] for p in practices.values()))
+        for practice in practices.values():
+            self.assertTrue(practice["why"])
+            self.assertTrue(practice["copy"], practice["practice"])
+        self.assertIn(".github/pull_request_template.md", practices["mr_template"]["copy"])
+
+    def test_ticket_keys_in_branches_and_commits_suggest_a_jira_tracker(self):
+        result = self.scan({}, remote="https://gitlab.example.com/acme/app.git",
+                           history=["feat/ACME-12-login", "fix: ACME-15 crash", "chore: deps", "feat/OTHER-1-x"])
+        self.assertEqual(result["tracker"], {"kind": "jira", "project": "ACME"})
+        self.assertEqual(result["closest_example"], "full")
+        self.assertEqual(result["proposed_profile"]["tracker"]["project"], "ACME")
+        self.assertEqual(result["forge"], "gitlab")
+        self.assertIn(".gitlab/merge_request_templates/Default.md", self.practices(result)["mr_template"]["copy"])
+
+    def test_a_single_ticket_key_is_not_a_tracker(self):
+        self.assertIsNone(self.scan({}, history=["feat/ACME-12-login", "chore: deps"])["tracker"])
+
+    def test_reads_the_package_manager_and_its_scripts_into_the_profile(self):
+        result = self.scan({"pnpm-lock.yaml": "", "package.json": {"scripts": {
+            "dev": "vite", "worktree": "node scripts/worktree.mjs"}}})
+        self.assertEqual(result["package_manager"], "pnpm")
+        profile = result["proposed_profile"]
+        self.assertEqual(profile["dev_server"], {"command": "pnpm dev"})
+        self.assertEqual(profile["worktree"], {"new": "pnpm worktree new {branch}", "remove": "pnpm worktree remove {branch}"})
+        self.assertTrue(self.practices(result)["worktree"]["present"])
+
+    def test_spots_the_practices_a_repo_already_has(self):
+        practices = self.practices(self.scan({
+            "CLAUDE.md": "# App\n\n## Development lifecycle (agents)\nNever merge.\n",
+            ".claude/settings.json": {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "x"}]}]}},
+            "docs/shared-concepts.md": "## Registry\n",
+            "package.json": {"scripts": {"docs:impact": "node scripts/docs-impact.mjs"}},
+            ".github/pull_request_template.md": "## Docs reviewed\n",
+            "scripts/bootstrap.mjs": "install('herdr@herdr-skills')",
+        }))
+        self.assertEqual([name for name, p in practices.items() if not p["present"]], ["worktree"])
+
+    def test_flags_the_plugin_in_the_projects_committed_settings(self):
+        result = self.scan({".claude/settings.json": {"enabledPlugins": {"herdr@herdr-skills": True}}})
+        self.assertTrue(result["plugin_in_committed_settings"])
+        self.assertFalse(self.scan({})["plugin_in_committed_settings"])
+
+    def test_reports_an_existing_profile_instead_of_proposing_one(self):
+        result = self.scan({".claude/herdr-profile.json": {"name": "app", "forge": "github"}})
+        self.assertTrue(result["profile"].endswith("herdr-profile.json"))
+        self.assertIsNone(result["proposed_profile"])
+
+    def test_every_file_it_suggests_copying_exists_in_the_full_example(self):
+        full = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "examples", "full")
+        for forge in ("github", "gitlab"):
+            for practice in ht.setup_scan(self.repo({}), "git@%s.com:a/b.git" % forge, [])["practices"]:
+                for name in practice["copy"]:
+                    self.assertTrue(os.path.isfile(os.path.join(full, name)), name)
+
+
+EXAMPLES = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "examples")
+
+
+class ExampleProfiles(unittest.TestCase):
+    """The examples are what people copy, so each must load through the same code a real profile does."""
+
+    def load(self, *parts):
+        with open(os.path.join(EXAMPLES, *parts)) as handle:
+            return json.load(handle)
+
+    def test_the_minimal_profile_is_a_github_repo_on_defaults(self):
+        resolved = ht.resolve_profile(self.load("minimal", ".claude", "herdr-profile.json"), "")
+        self.assertEqual((resolved["forge"], resolved["tracker"]["kind"]), ("github", "none"))
+
+    def test_the_full_profile_uses_gitlab_and_jira(self):
+        resolved = ht.resolve_profile(self.load("full", ".claude", "herdr-profile.json"), "")
+        self.assertEqual((resolved["forge"], resolved["tracker"]["kind"]), ("gitlab", "jira"))
+        self.assertIn("{branch}", resolved["worktree"]["new"])
+
+    def test_the_overlay_matches_a_repo_and_adds_only_personal_fields(self):
+        overlay = self.load("minimal", "overlay.example.json")
+        self.assertTrue(ht.select_profile([overlay], "/nowhere", "git@github.com:acme/acme-app.git"))
+        merged = ht.merge_profiles(self.load("minimal", ".claude", "herdr-profile.json"), overlay)
+        resolved = ht.resolve_profile(merged, "")
+        self.assertTrue(resolved["planning"])
+        self.assertTrue(resolved["mirrors"])
+        self.assertEqual(set(overlay) - {"name", "match"}, {"planning", "mirrors"})
+
+
 class Shareable(unittest.TestCase):
     """The plugin is shared: nothing in it may name one person or depend on one machine's checkout."""
 
@@ -1134,6 +1355,97 @@ class LandLoop(unittest.TestCase):
         forge = FakeForge([mr(detailed_merge_status="need_rebase"), mr(detailed_merge_status="need_rebase"), mr(sha="def", head_pipeline={"status": "success", "sha": "def"})])
         result = self.run_loop(forge)
         self.assertEqual((forge.rebased, forge.merged, result["rebased"]), (1, "def", True))
+
+
+class HeadLanded(unittest.TestCase):
+    """land rebases before merging, so the merged commit is rarely the worktree's HEAD: the same patch counts too."""
+
+    def test_says_how_head_matched_the_merge(self):
+        self.assertEqual(ht.head_landed_how("abc", "abc", False, None, None), "same commit")
+        self.assertEqual(ht.head_landed_how("abc", "def", True, None, None), "on the default branch")
+        self.assertEqual(ht.head_landed_how("abc", "def", False, "p1", "p1"), "same patch")
+
+    def test_none_when_nothing_matches(self):
+        self.assertIsNone(ht.head_landed_how("abc", "def", False, "p1", "p2"))
+        self.assertIsNone(ht.head_landed_how("abc", None, False, None, None))
+        self.assertIsNone(ht.head_landed_how("abc", "def", False, None, None))
+
+    def test_the_head_check_reports_how_it_matched(self):
+        check = checks_by_name(ht.retire_checks("idle", "", "merged", "same patch", ht.parse_status_report(REPORT)))["head"]
+        self.assertTrue(check["ok"])
+        self.assertIn("same patch", check["detail"])
+
+    def test_the_merged_commit_comes_from_either_forge(self):
+        self.assertEqual(ht.merged_commit({"squash_commit_sha": "sq", "merge_commit_sha": None}), "sq")
+        self.assertEqual(ht.merged_commit({"squash_commit_sha": None, "merge_commit_sha": "mc"}), "mc")
+        self.assertEqual(ht.merged_commit(ht.github_pr_to_mr(pr(state="MERGED", mergeCommit={"oid": "gh"}))), "gh")
+        self.assertIsNone(ht.merged_commit({}))
+
+
+def git_repo(test):
+    """A temporary repo with an `origin/main` ref, deleted after the test."""
+    path = tempfile.mkdtemp()
+    test.addCleanup(shutil.rmtree, path, ignore_errors=True)
+    def run(*args):
+        code, out = ht.git(path, "-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false", *args)
+        test.assertEqual(code, 0, (args, out))
+        return out
+    run("init", "-q", "-b", "main")
+    return path, run
+
+
+def write(path, name, text):
+    with open(os.path.join(path, name), "w") as handle:
+        handle.write(text)
+
+
+class PatchIds(unittest.TestCase):
+    def test_a_rebased_squash_has_the_same_patch_as_the_branch(self):
+        path, run = git_repo(self)
+        write(path, "a.txt", "one\ntwo\nthree\n")
+        run("add", "-A")
+        run("commit", "-qm", "base")
+        run("checkout", "-qb", "feature")
+        write(path, "a.txt", "one\ntwo\nthree\nfour\n")
+        run("commit", "-qam", "add four")
+        write(path, "b.txt", "new\n")
+        run("add", "-A")
+        run("commit", "-qm", "add b")
+        run("checkout", "-q", "main")
+        write(path, "c.txt", "someone else's work\n")
+        run("add", "-A")
+        run("commit", "-qm", "other merge")
+        run("merge", "--squash", "-q", "feature")
+        run("commit", "-qm", "feat: squashed")
+        squash = run("rev-parse", "HEAD")
+        run("update-ref", "refs/remotes/origin/main", "HEAD~1")  # the default branch before the squash landed
+        run("checkout", "-q", "feature")
+        branch = ht.branch_patch_id(path, "origin/main")
+        self.assertTrue(branch)
+        self.assertEqual(branch, ht.commit_patch_id(path, squash))
+        self.assertNotEqual(branch, ht.commit_patch_id(path, "main~1"))
+
+    def test_a_merge_commit_is_compared_against_its_first_parent(self):
+        path, run = git_repo(self)
+        write(path, "a.txt", "one\n")
+        run("add", "-A")
+        run("commit", "-qm", "base")
+        run("checkout", "-qb", "feature")
+        write(path, "a.txt", "one\ntwo\n")
+        run("commit", "-qam", "two")
+        run("checkout", "-q", "main")
+        write(path, "z.txt", "z\n")
+        run("add", "-A")
+        run("commit", "-qm", "other")
+        run("update-ref", "refs/remotes/origin/main", "HEAD")
+        run("merge", "--no-ff", "-q", "-m", "merge feature", "feature")
+        merge = run("rev-parse", "HEAD")
+        run("checkout", "-q", "feature")
+        self.assertEqual(ht.branch_patch_id(path, "origin/main"), ht.commit_patch_id(path, merge))
+
+    def test_an_unknown_commit_has_no_patch_id(self):
+        path, _ = git_repo(self)
+        self.assertIsNone(ht.commit_patch_id(path, "0" * 40))
 
 
 if __name__ == "__main__":

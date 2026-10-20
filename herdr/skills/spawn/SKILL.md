@@ -5,7 +5,7 @@ description: Start a new Herdr agent that works one ticket or task end to end in
 
 # Spawn — one ticket, one worktree, one agent
 
-Helper: `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/herdr_tools.py"` (refuses to run outside a Herdr pane). The flow is the same on every project; what differs comes from the project's profile.
+Helper: `sh "${CLAUDE_PLUGIN_ROOT}/scripts/herdr-tools"`, written `herdr_tools.py` below; it runs the helper with the first Python 3.9+ it finds (`python3`, `python` or `py -3`). It refuses to run outside a Herdr pane. The flow is the same on every project; what differs comes from the project's profile.
 
 ## 1. Settle the inputs
 

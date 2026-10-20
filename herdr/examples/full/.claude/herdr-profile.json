@@ -1,0 +1,26 @@
+{
+  "name": "acme-app",
+  "forge": "gitlab",
+  "tracker": {
+    "kind": "jira",
+    "project": "ACME",
+    "parent": "ACME-1",
+    "done_path": ["In Review", "Done"]
+  },
+  "worktree": {
+    "new": "npm run worktree -- new {branch}",
+    "remove": "npm run worktree -- remove {branch}"
+  },
+  "dev_server": {
+    "command": "npm run dev",
+    "ready": "listening on"
+  },
+  "restart_on": ["package-lock.json", "**/package.json", ".env.example", ".nvmrc"],
+  "brief": {
+    "mr_create": "glab mr create --fill --remove-source-branch --squash-before-merge",
+    "notes": [
+      "Done means `npm run check` passes, `npm run docs:impact` was run and its docs recorded in the MR's \"Docs reviewed\" section, and the branch is rebased on the default branch.",
+      "Shared rules and value sets have one owner each, listed in docs/shared-concepts.md: import them, never re-list their values."
+    ]
+  }
+}

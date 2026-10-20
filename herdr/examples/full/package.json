@@ -1,0 +1,16 @@
+{
+  "name": "acme-app",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "dev": "node --env-file-if-exists=.env.local src/server.ts",
+    "test": "node --test",
+    "check": "node --test",
+    "bootstrap": "node scripts/bootstrap.mjs",
+    "worktree": "node scripts/worktree.mjs",
+    "docs:impact": "node scripts/docs-impact.mjs"
+  }
+}

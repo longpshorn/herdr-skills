@@ -5,7 +5,7 @@ description: Every Herdr agent at a glance — which are blocked, done, working 
 
 # Status — every agent at a glance
 
-Helper: `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/herdr_tools.py"`. It refuses to run outside a Herdr pane (`HERDR_ENV` unset); if so, say you are not inside Herdr and stop.
+Helper: `sh "${CLAUDE_PLUGIN_ROOT}/scripts/herdr-tools"`, written `herdr_tools.py` below; it runs the helper with the first Python 3.9+ it finds (`python3`, `python` or `py -3`). It refuses to run outside a Herdr pane (`HERDR_ENV` unset); if so, say you are not inside Herdr and stop.
 
 1. Run `herdr_tools.py status`. Rows are sorted blocked, done, working, idle. `AGENT` is the target to use with `/herdr:ask` and `/herdr:peek` (a name, or a pane id for unnamed agents).
 2. Show the table. Then, for each **blocked** agent, run `/herdr:peek` on it and add one line saying what it is waiting for (a plan gate, a question, a permission or trust prompt). For each **done** agent, say it finished unseen work.
