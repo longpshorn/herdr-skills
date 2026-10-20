@@ -1,0 +1,66 @@
+[
+  {
+    "total_count": 6,
+    "jobs": [
+      {
+        "id": 118799104433,
+        "run_id": 39472275495,
+        "run_attempt": 1,
+        "name": "example (ubuntu-latest)",
+        "status": "completed",
+        "conclusion": "success",
+        "runner_name": "GitHub Actions 1000000124"
+      },
+      {
+        "id": 118799104836,
+        "run_id": 39472275495,
+        "run_attempt": 1,
+        "name": "helper (windows-latest)",
+        "status": "completed",
+        "conclusion": "success",
+        "runner_name": "GitHub Actions 1000000126"
+      },
+      {
+        "id": 118799104929,
+        "run_id": 39472275495,
+        "run_attempt": 1,
+        "name": "helper (macos-latest)",
+        "status": "completed",
+        "conclusion": "cancelled",
+        "runner_name": ""
+      }
+    ]
+  },
+  {
+    "total_count": 6,
+    "jobs": [
+      {
+        "id": 118799104935,
+        "run_id": 39472275495,
+        "run_attempt": 1,
+        "name": "example (macos-latest)",
+        "status": "completed",
+        "conclusion": "cancelled",
+        "runner_name": null
+      },
+      {
+        "id": 118799104989,
+        "run_id": 39472275495,
+        "run_attempt": 1,
+        "name": "helper (ubuntu-latest)",
+        "status": "completed",
+        "conclusion": "success",
+        "runner_name": "GitHub Actions 1000000125"
+      },
+      {
+        "id": 118799106211,
+        "run_id": 39472275495,
+        "run_attempt": 1,
+        "name": "example (windows-latest)",
+        "status": "completed",
+        "conclusion": "success",
+        "runner_name": "GitHub Actions 1000000129"
+      }
+    ]
+  }
+]
