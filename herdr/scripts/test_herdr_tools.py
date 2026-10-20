@@ -1228,6 +1228,9 @@ class SetupScan(unittest.TestCase):
         with open(os.path.join(EXAMPLES, "full", ".gitignore"), encoding="utf-8") as handle:
             self.assertIn(".env.local", handle.read().split())
 
+    def test_doc_checks_written_in_another_language_count(self):
+        for name in ("scripts/doc_parity.py", "bin/docs_impact.sh"):
+            self.assertTrue(self.practices(self.scan({name: ""}))["doc_checks"]["present"], name)
 
 
 EXAMPLES = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "examples")

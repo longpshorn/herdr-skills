@@ -446,7 +446,7 @@ def setup_scan(path, remote, history):
         "stop_hook": bool((settings.get("hooks") or {}).get("Stop")),
         "shared_concepts": os.path.isfile(os.path.join(path, "docs", "shared-concepts.md")),
         "doc_checks": any(s.startswith("docs") for s in scripts)
-                      or any(re.search(r"doc-parity|docs-impact", n) for n in script_files),
+                      or any(re.search(r"docs?[-_](parity|impact)", n) for n in script_files),
         "mr_template": any("docs reviewed" in (read(n) or "").lower() for n in templates),
         "personal_install": bool(installers),
     }
