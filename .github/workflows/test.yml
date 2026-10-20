@@ -7,7 +7,11 @@ on:
 
 jobs:
   helper:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
@@ -15,4 +19,4 @@ jobs:
         with:
           python-version: "3.9"
       - name: Unit tests for herdr_tools.py
-        run: python3 -m unittest discover -s herdr/scripts -p 'test_*.py' -v
+        run: python -m unittest discover -s herdr/scripts -p 'test_*.py' -v
