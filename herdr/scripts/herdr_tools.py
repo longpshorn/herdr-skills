@@ -868,13 +868,26 @@ class GitHubForge:
                        text=True, cwd=self.main)
 
     def merge(self, iid, sha):
-        proc = subprocess.run(["gh", "pr", "merge", str(iid), "--squash", "--match-head-commit", sha, "--delete-branch"]
-                              + self.repo_args, capture_output=True, text=True, cwd=self.main)
+        """Squash-merge pinned to SHA, then delete only the remote branch, as GitLab's should_remove_source_branch does.
+        Not gh's --delete-branch: it also deletes the local branch and the agent's worktree, which retire removes."""
+        proc = subprocess.run(["gh", "pr", "merge", str(iid), "--squash", "--match-head-commit", sha] + self.repo_args,
+                              capture_output=True, text=True, cwd=self.main)
         if proc.returncode != 0:
             raise HerdrError("gh pr merge failed: %s" % (proc.stderr or proc.stdout).strip())
-        pr = run_json(["gh", "pr", "view", str(iid), "--json", "state,url,mergeCommit"] + self.repo_args, self.main)
+        pr = run_json(["gh", "pr", "view", str(iid), "--json", "state,url,mergeCommit,headRefName"] + self.repo_args,
+                      self.main)
+        self.delete_remote_branch(pr.get("headRefName"))
         return {"state": {"MERGED": "merged"}.get(pr.get("state"), pr.get("state")),
                 "commit": (pr.get("mergeCommit") or {}).get("oid"), "url": pr.get("url")}
+
+    def delete_remote_branch(self, branch):
+        """A failure is a warning: the merge happened, and the repo's auto-delete may have removed the branch already."""
+        repo = self.repo_args[1] if self.repo_args else "{owner}/{repo}"
+        proc = subprocess.run(["gh", "api", "-X", "DELETE", "repos/%s/git/refs/heads/%s" % (repo, quote(branch))],
+                              capture_output=True, text=True, cwd=self.main)
+        if proc.returncode != 0:
+            print("warning: merged, but could not delete the remote branch %s: %s"
+                  % (branch, (proc.stderr or proc.stdout).strip()), file=sys.stderr, flush=True)
 
 
 def forge_for(profile):
