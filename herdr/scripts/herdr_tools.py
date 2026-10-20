@@ -22,6 +22,10 @@
       Merge the agent's validated MR (its worktree branch's, else the one its status report names), or the MR --mr
       names in any repo: rebase if behind, wait for the head pipeline, squash-merge pinned to that commit. Stops on a
       draft, conflicts, unresolved threads, a failed pipeline or a missing approval.
+  herdr_tools.py land AGENT AGENT... [--max-hours 3] [--timeout-minutes 30]
+      Land several agents' MRs in this order. An agent whose MR conflicts is asked once to rebase and retried after
+      the others until --max-hours; any other refusal fails that agent. Prints one line per agent; exits 1 unless
+      all merged.
   herdr_tools.py watch AGENT... [--max-hours 4] [--poll-seconds 120]
       Watch the agents' status reports and land the first one that is ready (MR open, pipeline passed, "ready to
       land", no open questions), then exit. An agent whose MR conflicts is asked once to rebase; an MR waiting on an
@@ -925,6 +929,49 @@ def watch(agents, max_hours=4.0, poll_seconds=120):
         lambda agent: read_report(agent)[1], max_hours * 3600, poll_seconds)
 
 
+def land_queue(agents, land_fn, ask_fn, max_seconds, poll_seconds=300, sleep=time.sleep, now=time.time):
+    """Land each agent's MR in the given order. A conflicting MR's agent is asked once to rebase and retried after the
+    others until the deadline; any other refusal fails that agent. One result per agent, in the given order."""
+    results, pending, asked = {}, list(agents), set()
+    deadline = now() + max_seconds
+    while pending:
+        for agent in list(pending):
+            try:
+                landed = land_fn(agent)
+            except HerdrError as error:
+                reason = str(error).splitlines()[-1]
+                if "conflicts" not in reason:
+                    results[agent] = {"agent": agent, "result": "failed", "detail": reason}
+                    pending.remove(agent)
+                    continue
+                if agent not in asked:
+                    ask_fn(agent, REBASE_REQUEST)
+                    asked.add(agent)
+                results[agent] = {"agent": agent, "result": "conflict",
+                                  "detail": "asked to rebase; still conflicts: %s" % reason}
+                continue
+            commit = (landed.get("commit") or "")[:8]
+            results[agent] = {"agent": agent, "result": "merged", "detail": "!%s %s%s" % (
+                landed.get("iid"), "was already merged" if landed.get("already_merged") else "merged",
+                " as " + commit if commit else "")}
+            pending.remove(agent)
+        if not pending or now() >= deadline:
+            break
+        print("waiting on %s to rebase" % ", ".join(pending), file=sys.stderr, flush=True)
+        sleep(poll_seconds)
+    return [results[agent] for agent in agents]
+
+
+def format_land_results(results):
+    return "\n".join("%s: %s (%s)" % (r["agent"], r["result"], r["detail"]) for r in results)
+
+
+def land_several(agents, timeout_minutes=30, max_hours=3.0, poll_seconds=300):
+    return land_queue(
+        agents, lambda agent: land(agent, timeout_minutes),
+        lambda agent, message: herdr("agent", "prompt", agent, message, parse=False), max_hours * 3600, poll_seconds)
+
+
 def update_main(path):
     """Fast-forward the main checkout to its remote default branch. Files that differ from HEAD only by JSON key
     order are restored first; any other local change stops the update."""
@@ -1155,9 +1202,10 @@ def main(argv=None):
     ri = sub.add_parser("retire-info")
     ri.add_argument("target")
     la = sub.add_parser("land")
-    la.add_argument("target", nargs="?")
+    la.add_argument("targets", nargs="*", metavar="target", help="one agent, or several to land in this order")
     la.add_argument("--mr", help="the MR to land, by URL or group/project!iid, when it isn't the agent's branch's")
     la.add_argument("--timeout-minutes", type=int, default=30)
+    la.add_argument("--max-hours", type=float, default=3.0, help="with several agents: how long to wait for rebases")
     wa = sub.add_parser("watch")
     wa.add_argument("agents", nargs="+")
     wa.add_argument("--max-hours", type=float, default=4.0)
@@ -1197,8 +1245,15 @@ def main(argv=None):
             print(path)
         elif args.command == "retire-info":
             print(json.dumps(retire_info(args.target), indent=2))
+        elif args.command == "land" and len(args.targets) > 1:
+            if args.mr:
+                raise HerdrError("--mr lands one MR; name several agents without it.")
+            results = land_several(args.targets, args.timeout_minutes, args.max_hours)
+            print(format_land_results(results))
+            return 0 if all(r["result"] == "merged" for r in results) else 1
         elif args.command == "land":
-            print(json.dumps(land(args.target, args.timeout_minutes, mr=args.mr), indent=2))
+            target = args.targets[0] if args.targets else None
+            print(json.dumps(land(target, args.timeout_minutes, mr=args.mr), indent=2))
         elif args.command == "watch":
             print(json.dumps(watch(args.agents, args.max_hours, args.poll_seconds), indent=2))
         elif args.command == "update-main":

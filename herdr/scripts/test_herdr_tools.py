@@ -1015,6 +1015,61 @@ class WatchLoop(unittest.TestCase):
         self.assertEqual(self.asked, [])
 
 
+CONFLICT = ht.HerdrError("Not landing !3: MR has conflicts; the agent must resolve them.")
+
+
+class LandQueue(unittest.TestCase):
+    def run_queue(self, outcomes, max_seconds=10):
+        """outcomes: agent -> list of results per attempt (an exception is raised); the last one repeats."""
+        self.asked, self.calls = [], []
+        clock = {"t": 0}
+        def land_fn(agent):
+            self.calls.append(agent)
+            results = outcomes[agent]
+            item = results.pop(0) if len(results) > 1 else results[0]
+            if isinstance(item, Exception):
+                raise item
+            return item
+        def sleep(seconds):
+            clock["t"] += seconds
+        return ht.land_queue(list(outcomes), land_fn, lambda agent, message: self.asked.append((agent, message)),
+                             max_seconds=max_seconds, poll_seconds=1, sleep=sleep, now=lambda: clock["t"])
+
+    def test_lands_each_in_the_given_order(self):
+        merged = {"state": "merged", "iid": 3, "commit": "c0ffee12345"}
+        results = self.run_queue({"c": [merged], "a": [merged], "b": [merged]})
+        self.assertEqual(self.calls, ["c", "a", "b"])
+        self.assertEqual([(r["agent"], r["result"]) for r in results], [("c", "merged"), ("a", "merged"), ("b", "merged")])
+
+    def test_a_conflict_asks_the_agent_to_rebase_keeps_going_and_retries_it_at_the_end(self):
+        merged = {"state": "merged", "iid": 3}
+        results = self.run_queue({"a": [CONFLICT, merged], "b": [merged]})
+        self.assertEqual(self.calls, ["a", "b", "a"])
+        self.assertEqual([a for a, _ in self.asked], ["a"])
+        self.assertIn("rebase", self.asked[0][1].lower())
+        self.assertEqual([(r["agent"], r["result"]) for r in results], [("a", "merged"), ("b", "merged")])
+
+    def test_an_agent_still_conflicting_at_the_deadline_is_reported_and_asked_only_once(self):
+        results = self.run_queue({"a": [CONFLICT], "b": [{"state": "merged", "iid": 4}]}, max_seconds=3)
+        self.assertEqual([a for a, _ in self.asked], ["a"])
+        self.assertEqual({r["agent"]: r["result"] for r in results}, {"a": "conflict", "b": "merged"})
+
+    def test_any_other_refusal_fails_that_agent_without_retrying_it(self):
+        results = self.run_queue({"a": [ht.HerdrError("Not landing !3: head pipeline failed.")],
+                                  "b": [{"state": "merged", "iid": 4}]})
+        self.assertEqual(self.calls, ["a", "b"])
+        self.assertEqual(results[0]["result"], "failed")
+        self.assertIn("head pipeline failed", results[0]["detail"])
+        self.assertEqual(self.asked, [])
+
+    def test_one_line_per_agent(self):
+        lines = ht.format_land_results([
+            {"agent": "a", "result": "merged", "detail": "!3 merged as c0ffee12"},
+            {"agent": "b", "result": "conflict", "detail": "still conflicts"},
+        ])
+        self.assertEqual(lines.splitlines(), ["a: merged (!3 merged as c0ffee12)", "b: conflict (still conflicts)"])
+
+
 class Shareable(unittest.TestCase):
     """The plugin is shared: nothing in it may name one person or depend on one machine's checkout."""
 
