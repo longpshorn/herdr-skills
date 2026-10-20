@@ -178,16 +178,25 @@ class FakeAgentHerdr:
 
 
 class AgentHerdrTest(unittest.TestCase):
-    """Stubs `herdr` and git, and points HOME at a temporary directory for the saved-prompt files."""
+    """Stubs `herdr` and git, and points the home directory at a temporary one for the saved-prompt files (HOME, and
+    USERPROFILE, which is what expanduser reads on Windows)."""
+
+    HOME_VARS = ("HOME", "USERPROFILE")
 
     def setUp(self):
-        self.saved = ht.herdr, ht.repo_root, os.environ.get("HOME")
+        self.saved = ht.herdr, ht.repo_root, {name: os.environ.get(name) for name in self.HOME_VARS}
         ht.repo_root = lambda path: REPO
         self.home = tempfile.mkdtemp()
-        os.environ["HOME"] = self.home
+        for name in self.HOME_VARS:
+            os.environ[name] = self.home
 
     def tearDown(self):
-        ht.herdr, ht.repo_root, os.environ["HOME"] = self.saved
+        ht.herdr, ht.repo_root, env = self.saved
+        for name, value in env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
         shutil.rmtree(self.home)
 
     def use(self, fake):
@@ -202,7 +211,7 @@ class Launch(AgentHerdrTest):
     def test_lets_herdr_find_or_create_the_parent_from_the_main_checkout(self):
         fake = self.use(FakeAgentHerdr())
         self.launch()
-        self.assertEqual(fake.called("worktree", "open"), [("worktree", "open", "--cwd", REPO, "--path", REPO + "-TICKET-2",
+        self.assertEqual(fake.called("worktree", "open"), [("worktree", "open", "--cwd", REPO, "--path", os.path.abspath(REPO + "-TICKET-2"),
                                                             "--label", "TICKET-2 x", "--no-focus")])
         self.assertEqual(fake.called("workspace"), [])
 
@@ -518,7 +527,8 @@ None
 
 class StatusReportPath(unittest.TestCase):
     def test_lives_in_the_herdr_status_cache_named_after_the_agent(self):
-        self.assertEqual(ht.status_report_path("res1", home="/home/p"), "/home/p/.cache/herdr/status/res1.md")
+        self.assertEqual(ht.status_report_path("res1", home="/home/p"),
+                         os.path.join("/home/p", ".cache", "herdr", "status", "res1.md"))
 
 
 class ParseStatusReport(unittest.TestCase):
