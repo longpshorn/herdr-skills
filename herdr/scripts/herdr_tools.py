@@ -365,7 +365,8 @@ def load_profile(main_checkout, remote_url, overlay_dir=OVERLAY_DIR):
 PRACTICES = [
     ("worktree", "A worktree command gives each agent its own checkout, bootstrapped, with its own ports, so parallel "
                  "agents never share a dev server or node_modules.",
-     ["scripts/worktree.mjs", "scripts/lib/worktree.mjs", "scripts/lib/worktree.test.mjs"]),
+     ["scripts/worktree.mjs", "scripts/lib/worktree.mjs", "scripts/lib/worktree.test.mjs", "scripts/bootstrap.mjs",
+      "scripts/lib/herdr-plugin.mjs", "scripts/lib/herdr-plugin.test.mjs", ".gitignore"]),
     ("agent_lifecycle", "Agents follow the repo's CLAUDE.md: test first, never merge, rebase and hand over, run the "
                         "doc check. Without it each agent improvises its own process.",
      ["CLAUDE.md"]),
@@ -377,12 +378,13 @@ PRACTICES = [
     ("doc_checks", "A doc-parity check fails the build when docs name commands or files that no longer exist, and "
                    "docs-impact lists the docs a change may have made untrue.",
      ["scripts/lib/doc-parity.mjs", "scripts/lib/doc-parity.test.mjs", "scripts/docs-impact.mjs",
-      "scripts/lib/docs-impact.mjs", "scripts/lib/docs-impact.test.mjs"]),
+      "scripts/lib/docs-impact.mjs", "scripts/lib/docs-impact.test.mjs", "scripts/lib/shared-concepts.mjs"]),
     ("mr_template", "An MR or PR template with a \"Docs reviewed\" section makes the agent record each doc it reread.",
      None),
     ("personal_install", "Bootstrap installs the herdr plugin into each developer's own settings when it is missing, "
                          "never into the project's committed settings.",
-     ["scripts/bootstrap.mjs", "scripts/lib/herdr-plugin.mjs", "scripts/lib/herdr-plugin.test.mjs"]),
+     ["scripts/bootstrap.mjs", "scripts/lib/herdr-plugin.mjs", "scripts/lib/herdr-plugin.test.mjs",
+      "scripts/lib/worktree.mjs", "scripts/lib/worktree.test.mjs"]),
 ]
 MR_TEMPLATE = {"github": ".github/pull_request_template.md", "gitlab": ".gitlab/merge_request_templates/Default.md"}
 MR_TEMPLATE_GLOBS = [".gitlab/merge_request_templates/*.md", ".github/pull_request_template.md",

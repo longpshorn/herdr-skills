@@ -16,7 +16,7 @@ Helper: `sh "${CLAUDE_PLUGIN_ROOT}/scripts/herdr-tools"`, written `herdr_tools.p
 4. **Confirm once.** Ask which to apply: the profile (as shown, or edited), and which practices to copy. Nothing is written before this answer.
 5. **Apply** only what was approved.
    - Write `.claude/herdr-profile.json`.
-   - Copy each approved practice's files from `${CLAUDE_PLUGIN_ROOT}/examples/full/`, keeping their paths. Never overwrite an existing file: for one that exists (a `CLAUDE.md`, a `.claude/settings.json`, a template), merge the example's section into it and show the diff.
+   - Copy each approved practice's files from `${CLAUDE_PLUGIN_ROOT}/examples/full/`, keeping their paths. Never overwrite an existing file: for one that exists (a `CLAUDE.md`, a `.claude/settings.json`, a `.gitignore`, a template), merge the example's section into it and show the diff. Practices share some files (the bootstrap, the worktree library); copy each one once.
    - Adapt each copy to the repo: its package manager and script names, its source folders (the shared-concepts and doc-parity checks guard `src/`), its default branch, and the `ACME` placeholders. Add the scripts the copies need to `package.json`.
    - The Stop hook and the checks run `npm run check`; point them at the repo's real check command.
    - For a repo that isn't Node, copy the idea, not the file: say what the practice needs and write the smallest equivalent in the repo's language, test-first.

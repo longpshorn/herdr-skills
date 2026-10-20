@@ -1,6 +1,8 @@
 """Tests for herdr_tools: its pure logic, and its herdr flows against a stubbed `herdr`. Run: python3 -m unittest discover -s <this dir> -p 'test_*.py'"""
 import json
 import os
+import posixpath
+import re
 import shutil
 import subprocess
 import sys
@@ -1205,6 +1207,27 @@ class SetupScan(unittest.TestCase):
             for practice in ht.setup_scan(self.repo({}), "git@%s.com:a/b.git" % forge, [])["practices"]:
                 for name in practice["copy"]:
                     self.assertTrue(os.path.isfile(os.path.join(full, name)), name)
+
+    def test_a_practice_copied_alone_carries_every_file_its_copies_import_or_run(self):
+        full = os.path.join(EXAMPLES, "full")
+        relative = re.compile(r"""(?:^import\s[^'"]*?from\s+|new URL\(\s*)['"](\.\.?/[^'"]+)['"]""", re.M)
+        from_root = re.compile(r"""['"](scripts/[\w./-]+\.mjs)['"]""")
+        for practice in ht.setup_scan(self.repo({}), "git@github.com:a/b.git", [])["practices"]:
+            copy = set(practice["copy"])
+            for name in [n for n in copy if n.endswith(".mjs")]:
+                with open(os.path.join(full, name), encoding="utf-8") as handle:
+                    text = handle.read()
+                needs = {posixpath.normpath(posixpath.join(posixpath.dirname(name), m)) for m in relative.findall(text)}
+                needs |= set(from_root.findall(text))
+                self.assertEqual(sorted(needs - copy), [], "%s: %s" % (practice["practice"], name))
+
+    def test_the_worktree_practice_ignores_the_env_file_its_bootstrap_writes(self):
+        # an untracked .env.local makes `worktree remove` refuse every worktree it created
+        copy = self.practices(self.scan({}))["worktree"]["copy"]
+        self.assertIn(".gitignore", copy)
+        with open(os.path.join(EXAMPLES, "full", ".gitignore"), encoding="utf-8") as handle:
+            self.assertIn(".env.local", handle.read().split())
+
 
 
 EXAMPLES = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "examples")
