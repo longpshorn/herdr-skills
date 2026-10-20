@@ -3,5 +3,7 @@
   "description": "Herdr skills for one-ticket, one-worktree, one-agent work: see every agent, spawn a ticket agent in its own worktree from a brief, talk to and read agents, run commands in a sibling pane, land and retire finished work",
   "author": {
     "name": "Patrick Smith"
-  }
+  },
+  "license": "MIT",
+  "repository": "https://github.com/longpshorn/herdr-skills"
 }

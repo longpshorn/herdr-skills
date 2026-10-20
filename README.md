@@ -81,3 +81,7 @@ python3 -m unittest discover -s herdr/scripts -p 'test_*.py'
 ```
 
 To work on the skills, clone this repo and register the clone as a marketplace (`claude plugin marketplace add ./herdr-skills`). Claude Code reads a local marketplace in place, so a new session picks up your edits.
+
+## License
+
+[MIT](LICENSE).
