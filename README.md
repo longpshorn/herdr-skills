@@ -12,28 +12,17 @@ This repository is a Claude Code plugin marketplace (`herdr-skills`) with one pl
 
 ## Install
 
-**For a project's whole team**, declare the marketplace and enable the plugin in the repo's `.claude/settings.json`:
-
-```json
-{
-  "extraKnownMarketplaces": {
-    "herdr-skills": { "source": { "source": "github", "repo": "longpshorn/herdr-skills" }, "autoUpdate": true }
-  },
-  "enabledPlugins": { "herdr@herdr-skills": true }
-}
-```
-
-Claude Code registers the marketplace when a session starts in the project, but it doesn't install a plugin that is only enabled in project settings, so install it in the project's setup script: `claude plugin install herdr@herdr-skills --scope local` (`--scope project` would rewrite the committed settings file).
-
-**Just for you, in every repo:**
+Install it into your personal Claude Code settings (user scope), so it works in every repo:
 
 ```bash
 brew install herdr
-claude plugin marketplace add longpshorn/herdr-skills
+claude plugin marketplace add longpshorn/herdr-skills --scope user
 claude plugin install herdr@herdr-skills --scope user
 ```
 
-The plugin has no pinned version, so every commit here is a new version. With `autoUpdate` on, Claude Code picks it up when a session starts; otherwise run `claude plugin update herdr@herdr-skills`.
+**For a project's team**, have the project's setup script run those commands for each developer, only when they are missing. Treat an existing `herdr-skills` marketplace (such as a local clone someone edits) or an installed `herdr@herdr-skills` as present, and leave it alone. Keep the plugin out of the project's committed `.claude/settings.json`: it is each developer's tool, not a project dependency. What the project shares goes in its profile (below).
+
+The plugin has no pinned version, so every commit here is a new version. Run `claude plugin update herdr@herdr-skills` to take it, or turn on auto-update for the `herdr-skills` marketplace in `/plugin` → Marketplaces.
 
 ## Getting started
 
