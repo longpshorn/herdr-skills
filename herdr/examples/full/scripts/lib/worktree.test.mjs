@@ -34,7 +34,7 @@ test('.env.local gets the port once and is never overwritten', () => {
 
 // The rest runs real git in a temporary main checkout cloned from a bare "origin".
 function sandbox(t) {
-  const dir = realpathSync(mkdtempSync(path.join(tmpdir(), 'wt-')));
+  const dir = realpathSync.native(mkdtempSync(path.join(tmpdir(), 'wt-')));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const git = (cwd, ...args) => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@example.com',
     '-c', 'commit.gpgsign=false', ...args], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
