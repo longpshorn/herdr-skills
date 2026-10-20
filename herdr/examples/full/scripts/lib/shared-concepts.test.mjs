@@ -49,6 +49,27 @@ test('a missing owner file or export is reported', () => {
     /src\/durations.ts does not export DURATIONS/);
 });
 
+const withTelltales = (cell) => files({ 'docs/shared-concepts.md': REGISTRY.replace(/\| `\\b.*` \|$/m, `| ${cell} |`) });
+
+test('a tell-tale that matches the empty string (an escaped || in a table cell) is reported, not run', () => {
+  assert.deepEqual(registryEntries(withTelltales('`ttlMs\\|\\|timeoutMs`')['docs/shared-concepts.md'])[0].patterns,
+    ['ttlMs||timeoutMs']);
+  assert.deepEqual(check(withTelltales('`ttlMs\\|\\|timeoutMs`')),
+    ['Durations: tell-tale ttlMs||timeoutMs matches the empty string, so it would flag every line']);
+});
+
+test('a tell-tale that is not a valid regex is reported, not thrown', () => {
+  const problems = check(withTelltales('`(ttlMs`'));
+  assert.equal(problems.length, 1);
+  assert.match(problems[0], /^Durations: tell-tale \(ttlMs is not a valid regex \(.+\)$/);
+});
+
+test('the concept\'s other tell-tales still run when one is rejected', () => {
+  const problems = check({ ...withTelltales('`(ttlMs` `timeoutMs:\\s*[1-9]`'), 'src/session.ts': 'const c = { timeoutMs: 5 };\n' });
+  assert.equal(problems.length, 2);
+  assert.equal(problems[1], 'src/session.ts:1 re-lists Durations (timeoutMs:\\s*[1-9]): use DURATIONS from src/durations.ts');
+});
+
 test('a repo without the registry is told where it goes', () => {
   assert.deepEqual(check({}), ['docs/shared-concepts.md is missing']);
 });
