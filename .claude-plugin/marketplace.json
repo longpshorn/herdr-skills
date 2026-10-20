@@ -1,0 +1,14 @@
+{
+  "name": "herdr-skills",
+  "description": "Claude Code skills for running coding agents in Herdr: one ticket, one worktree, one agent",
+  "owner": {
+    "name": "Patrick Smith"
+  },
+  "plugins": [
+    {
+      "name": "herdr",
+      "description": "Herdr skills: /herdr:status, /herdr:spawn, /herdr:ask, /herdr:peek, /herdr:run, /herdr:retire",
+      "source": "./herdr"
+    }
+  ]
+}
