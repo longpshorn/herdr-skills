@@ -32,7 +32,7 @@ herdr_tools.py launch --path <worktree> --label "<label>" --name <agent> \
   --prompt "Read the brief at <brief path> and carry it out end to end. It is your full task. Plan first and stop at the plan gate for approval in this pane, then work test-first."
 ```
 
-It opens the worktree as a background workspace (Herdr reuses the repo's parent workspace on its main checkout, or creates one), starts the agent, and sends the prompt. Read its JSON:
+It opens the worktree as a background workspace (Herdr reuses the repo's parent workspace on its main checkout, or creates one), starts the agent, and sends the prompt. A new workspace's shell can take a few seconds to come up; launch retries `herdr agent start` until it is ready (up to 30s) and otherwise fails with a message naming the command to run by hand. Read its JSON:
 
 - `trust_prompt: true` — the agent is at Claude's folder-trust prompt, and launch saved the prompt instead of sending it. Never answer the trust prompt for the user. Tell them which workspace to open, then run `herdr_tools.py send-prompt --name <agent>` in the background (`run_in_background`): it waits up to 10 minutes for them to answer, sends the saved prompt and confirms the agent is working. If it times out, re-run it once they have answered.
 - `status: working` (or `idle` with `prompted: true`, a prompt it already finished) — done. `status: blocked` soon after is usually the agent's own question; `/herdr:peek` it.

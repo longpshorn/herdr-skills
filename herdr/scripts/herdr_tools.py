@@ -16,11 +16,12 @@
   herdr_tools.py report-path --name AGENT
       Create the status-report directory and print the file AGENT keeps its status report in.
   herdr_tools.py retire-info AGENT|WORKSPACE_ID|LABEL
-      JSON for /herdr:retire: workspace, worktree, main checkout, branch, MR, the agent's parsed status report,
-      and every retire check with ok and detail.
-  herdr_tools.py land AGENT|WORKSPACE_ID|LABEL [--timeout-minutes 30]
-      Merge the agent's validated MR: rebase if behind, wait for the head pipeline, squash-merge pinned to that commit.
-      Stops when the MR still needs an approval.
+      JSON for /herdr:retire: workspace, worktree, main checkout, branch, MR (the worktree branch's, else the one the
+      agent's status report names, in any repo), the agent's parsed status report, and every retire check.
+  herdr_tools.py land [AGENT|WORKSPACE_ID|LABEL] [--mr URL|GROUP/PROJECT!IID] [--timeout-minutes 30]
+      Merge the agent's validated MR (its worktree branch's, else the one its status report names), or the MR --mr
+      names in any repo: rebase if behind, wait for the head pipeline, squash-merge pinned to that commit. Stops on a
+      draft, conflicts, unresolved threads, a failed pipeline or a missing approval.
   herdr_tools.py watch AGENT... [--max-hours 4] [--poll-seconds 120]
       Watch the agents' status reports and land the first one that is ready (MR open, pipeline passed, "ready to
       land", no open questions), then exit. An agent whose MR conflicts is asked once to rebase; an MR waiting on an
@@ -46,6 +47,7 @@ import shutil
 import subprocess
 import sys
 import time
+from urllib.parse import quote
 
 ATTENTION_ORDER = {"blocked": 0, "done": 1, "working": 2, "idle": 3, "unknown": 4}
 TRUST_PROMPT = re.compile(r"trust (the files in )?this folder|Do you trust", re.IGNORECASE)
@@ -377,6 +379,36 @@ def gitlab_approval(approvals):
     }
 
 
+MR_URL = re.compile(r"^https?://([^/\s]+)/(.+?)/-/merge_requests/(\d+)(?:[/?#]\S*)?$")
+PR_URL = re.compile(r"^https?://(github\.com)/([^/\s]+/[^/\s]+)/pull/(\d+)(?:[/?#]\S*)?$")
+MR_SHORT = re.compile(r"^([\w.-]+(?:/[\w.-]+)+)!(\d+)$")
+
+
+def parse_mr_ref(text):
+    """A merge request named by its GitLab URL, its GitHub pull-request URL, or `group/project!iid` (gitlab.com)."""
+    text = (text or "").strip()
+    match = MR_URL.match(text)
+    if match:
+        return {"forge": "gitlab", "host": match.group(1), "project": match.group(2), "iid": int(match.group(3))}
+    match = PR_URL.match(text)
+    if match:
+        return {"forge": "github", "host": match.group(1), "project": match.group(2), "iid": int(match.group(3))}
+    match = MR_SHORT.match(text)
+    if match:
+        return {"forge": "gitlab", "host": "gitlab.com", "project": match.group(1), "iid": int(match.group(2))}
+    raise HerdrError("%r names no merge request: pass its URL or `group/project!iid`." % text)
+
+
+def report_mr_ref(report):
+    """The first merge request the agent's status report names in its `mr:` line, or None."""
+    for word in re.split(r"[\s,;]+", (report or {}).get("fields", {}).get("mr", "") if report else ""):
+        try:
+            return parse_mr_ref(word)
+        except HerdrError:
+            continue
+    return None
+
+
 def land_decision(mr):
     """What landing an MR needs next: merge, rebase, wait, done, or stop (with a reason).
 
@@ -515,7 +547,12 @@ def herdr(*args, parse=True):
     proc = subprocess.run(["herdr", *args], capture_output=True, text=True)
     if proc.returncode != 0:
         raise HerdrError((proc.stderr or proc.stdout).strip() or "herdr %s failed" % " ".join(args))
-    return json.loads(proc.stdout) if parse else proc.stdout
+    if not parse:
+        return proc.stdout
+    try:
+        return json.loads(proc.stdout)
+    except ValueError:
+        raise HerdrError("`herdr %s` output was not JSON: %s" % (" ".join(args[:2]), proc.stdout.strip()[:200] or "(empty)"))
 
 
 def repo_root(path):
@@ -591,13 +628,17 @@ def run_json(args, cwd):
 
 
 class GitLabForge:
-    """Merge requests through glab, run in the main checkout so `:fullpath` resolves to the project."""
+    """Merge requests through glab. Without a project it runs in the main checkout, so `:fullpath` resolves to the
+    checkout's project; with one (an MR named by URL, maybe in another repo) it names the project and host itself."""
 
-    def __init__(self, main_checkout):
-        self.main = main_checkout
+    def __init__(self, main_checkout, project=None, host=None):
+        self.main, self.host = main_checkout, host
+        self.base = "projects/%s/merge_requests" % (quote(project, safe="") if project else ":fullpath")
 
     def api(self, path, method="GET", fields=()):
         args = ["glab", "api", "-X", method, path]
+        if self.host:
+            args += ["--hostname", self.host]
         for key, value in fields:
             args += ["-f", "%s=%s" % (key, value)]
         return run_json(args, self.main) or {}
@@ -609,31 +650,33 @@ class GitLabForge:
         return {"iid": mrs[0]["iid"], "state": mrs[0]["state"], "url": mrs[0]["web_url"], "sha": mrs[0].get("sha")} if mrs else None
 
     def view(self, iid):
-        mr = self.api("projects/:fullpath/merge_requests/%d?include_rebase_in_progress=true" % iid)
-        mr["approvals"] = gitlab_approval(self.api("projects/:fullpath/merge_requests/%d/approvals" % iid))
+        mr = self.api("%s/%d?include_rebase_in_progress=true" % (self.base, iid))
+        mr["approvals"] = gitlab_approval(self.api("%s/%d/approvals" % (self.base, iid)))
         return mr, bool(mr.get("rebase_in_progress"))
 
     def rebase(self, iid):
-        self.api("projects/:fullpath/merge_requests/%d/rebase" % iid, "PUT")
+        self.api("%s/%d/rebase" % (self.base, iid), "PUT")
 
     def merge(self, iid, sha):
-        merged = self.api("projects/:fullpath/merge_requests/%d/merge" % iid, "PUT",
+        merged = self.api("%s/%d/merge" % (self.base, iid), "PUT",
                           [("sha", sha), ("squash", "true"), ("should_remove_source_branch", "true")])
         return {"state": merged.get("state"), "commit": merged.get("squash_commit_sha") or merged.get("merge_commit_sha"),
                 "url": merged.get("web_url")}
 
 
 class GitHubForge:
-    """Pull requests through gh, normalized to the merge-request shape land_decision reads."""
+    """Pull requests through gh, normalized to the merge-request shape land_decision reads. With a repo (a PR named by
+    URL) every call names it; without one gh resolves it from the main checkout."""
 
     FIELDS = "number,state,url,headRefOid,isDraft,mergeable,mergeStateStatus,statusCheckRollup,reviewDecision"
 
-    def __init__(self, main_checkout):
+    def __init__(self, main_checkout, repo=None):
         self.main = main_checkout
+        self.repo_args = ["--repo", repo] if repo else []
 
     def find(self, branch):
-        prs = run_json(["gh", "pr", "list", "--head", branch, "--state", "all", "--json", "number,state,url,headRefOid"],
-                       self.main) or []
+        prs = run_json(["gh", "pr", "list", "--head", branch, "--state", "all", "--json", "number,state,url,headRefOid"]
+                       + self.repo_args, self.main) or []
         prs.sort(key=lambda p: (p.get("state") != "MERGED", -p.get("number", 0)))
         if not prs:
             return None
@@ -641,17 +684,19 @@ class GitHubForge:
         return {"iid": mr["iid"], "state": mr["state"], "url": mr["web_url"], "sha": mr["sha"]}
 
     def view(self, iid):
-        return github_pr_to_mr(run_json(["gh", "pr", "view", str(iid), "--json", self.FIELDS], self.main)), False
+        return github_pr_to_mr(run_json(["gh", "pr", "view", str(iid), "--json", self.FIELDS] + self.repo_args,
+                                        self.main)), False
 
     def rebase(self, iid):
-        subprocess.run(["gh", "pr", "update-branch", str(iid), "--rebase"], capture_output=True, text=True, cwd=self.main)
+        subprocess.run(["gh", "pr", "update-branch", str(iid), "--rebase"] + self.repo_args, capture_output=True,
+                       text=True, cwd=self.main)
 
     def merge(self, iid, sha):
-        proc = subprocess.run(["gh", "pr", "merge", str(iid), "--squash", "--match-head-commit", sha, "--delete-branch"],
-                              capture_output=True, text=True, cwd=self.main)
+        proc = subprocess.run(["gh", "pr", "merge", str(iid), "--squash", "--match-head-commit", sha, "--delete-branch"]
+                              + self.repo_args, capture_output=True, text=True, cwd=self.main)
         if proc.returncode != 0:
             raise HerdrError("gh pr merge failed: %s" % (proc.stderr or proc.stdout).strip())
-        pr = run_json(["gh", "pr", "view", str(iid), "--json", "state,url,mergeCommit"], self.main)
+        pr = run_json(["gh", "pr", "view", str(iid), "--json", "state,url,mergeCommit"] + self.repo_args, self.main)
         return {"state": {"MERGED": "merged"}.get(pr.get("state"), pr.get("state")),
                 "commit": (pr.get("mergeCommit") or {}).get("oid"), "url": pr.get("url")}
 
@@ -661,6 +706,29 @@ def forge_for(profile):
     if profile["forge"] not in forges:
         raise HerdrError("No forge for %s (origin %s); set \"forge\" in its profile." % (profile["main_checkout"], profile["remote"]))
     return forges[profile["forge"]](profile["main_checkout"])
+
+
+def forge_for_ref(ref, cwd):
+    """A forge bound to the project a parsed MR reference names (see parse_mr_ref), usable from any directory."""
+    if ref["forge"] == "github":
+        return GitHubForge(cwd, ref["project"])
+    return GitLabForge(cwd, ref["project"], ref["host"])
+
+
+def resolve_mr(forge, branch, report, cwd, forge_factory=None):
+    """The agent's merge request and a forge for it: its worktree branch's, else the first one its status report
+    names. The second may live in another repo (an agent working in one checkout can open its MR in another), so it
+    gets a forge bound to that project. (None, forge) when neither has one."""
+    mr = forge.find(branch) if branch else None
+    if mr:
+        return mr, forge
+    ref = report_mr_ref(report)
+    if not ref:
+        return None, forge
+    other = (forge_factory or forge_for_ref)(ref, cwd)
+    viewed = other.view(ref["iid"])[0]
+    return {"iid": ref["iid"], "state": viewed.get("state"), "url": viewed.get("web_url"), "sha": viewed.get("sha"),
+            "ref": "%s!%d" % (ref["project"], ref["iid"]) if ref["forge"] == "gitlab" else viewed.get("web_url")}, other
 
 
 def read_report(agent):
@@ -692,9 +760,8 @@ def retire_info(target):
         branch = branch or reported_branch  # detached HEAD: trust the branch the agent reported
         _, porcelain = git(path, "status", "--porcelain")
     profile = project_profile(main_checkout)
-    forge = forge_for(profile)
     looks_like_branch = bool(branch) and " " not in branch
-    mr = forge.find(branch) if looks_like_branch else None
+    mr, forge = resolve_mr(forge_for(profile), branch if looks_like_branch else None, report, main_checkout)
     approval = forge.view(mr["iid"])[0]["approvals"] if mr and mr["state"] == "opened" else None
     if not removed:
         default = git(main_checkout, "symbolic-ref", "--short", "refs/remotes/origin/HEAD")[1] or "origin/main"
@@ -712,7 +779,7 @@ def retire_info(target):
         "main_checkout": main_checkout,
         "branch": branch or None,
         "head": head,
-        "mr": {"iid": mr["iid"], "state": mr["state"], "url": mr["url"]} if mr else None,
+        "mr": {"iid": mr["iid"], "state": mr["state"], "url": mr["url"], "ref": mr.get("ref")} if mr else None,
         "report_path": report_path,
         "report": report,
         "followups": report_followups(report),
@@ -758,12 +825,21 @@ def land_loop(forge, iid, timeout_seconds, poll_seconds=20, sleep=time.sleep, ma
         sleep(poll_seconds)
 
 
-def land(target, timeout_minutes=30, poll_seconds=20):
-    """Merge a validated MR or PR: rebase when it is behind, wait for the head pipeline, then squash-merge pinned to that commit."""
+def land(target, timeout_minutes=30, poll_seconds=20, mr=None):
+    """Merge a validated MR or PR: rebase when it is behind, wait for the head pipeline, then squash-merge pinned to that
+    commit. The MR is the agent's (its worktree branch's, else the one its status report names) or the one `mr` names
+    by URL or `group/project!iid`, which may live in any repo."""
+    if mr is not None:
+        ref = parse_mr_ref(mr)
+        return land_loop(forge_for_ref(ref, os.getcwd()), ref["iid"], timeout_minutes * 60, poll_seconds)
+    if not target:
+        raise HerdrError("Name the agent whose MR to land, or the MR itself with --mr <url or group/project!iid>.")
     info = retire_info(target)
     if not info["mr"]:
-        raise HerdrError("No merge request found for %s." % info["branch"])
-    forge = forge_for(project_profile(info["main_checkout"]))
+        raise HerdrError("No merge request found for %s, and the agent's status report names none; pass it with "
+                         "--mr <url or group/project!iid>." % info["branch"])
+    ref = info["mr"]["ref"] and parse_mr_ref(info["mr"]["ref"])
+    forge = forge_for_ref(ref, info["main_checkout"]) if ref else forge_for(project_profile(info["main_checkout"]))
     return land_loop(forge, info["mr"]["iid"], timeout_minutes * 60, poll_seconds)
 
 
@@ -939,7 +1015,32 @@ def send_prompt(name, prompt=None, timeout_seconds=600, poll_seconds=3, sleep=ti
     return {"agent": name, "status": status, "prompted": True}
 
 
-def launch(path, label, name, kind, prompt, sleep=time.sleep):
+# A just-created workspace's pane may not have its shell yet; herdr then refuses `agent start` with agent_pane_busy.
+PANE_BUSY_TIMEOUT = 30
+
+
+def start_agent(name, kind, pane, sleep=time.sleep, busy_timeout_seconds=PANE_BUSY_TIMEOUT):
+    """`herdr agent start`, retrying a busy pane with backoff until its shell is available or the timeout passes."""
+    delay, waited = 0.5, 0.0
+    while True:
+        try:
+            herdr("agent", "start", name, "--kind", kind, "--pane", pane, "--timeout", "60000")
+            return
+        except HerdrError as error:
+            if "agent_pane_busy" not in str(error):
+                raise
+            if waited >= busy_timeout_seconds:
+                raise HerdrError(
+                    "The new pane %s for agent %s was not ready: its shell did not become available within %gs "
+                    "(herdr: agent_pane_busy). Start it by hand once it is: `herdr agent start %s --kind %s --pane %s "
+                    "--timeout 60000`." % (pane, name, busy_timeout_seconds, name, kind, pane))
+            step = min(delay, busy_timeout_seconds - waited)
+            sleep(step)
+            waited += step
+            delay = min(delay * 2, 5)
+
+
+def launch(path, label, name, kind, prompt, sleep=time.sleep, busy_timeout_seconds=PANE_BUSY_TIMEOUT):
     path = os.path.abspath(os.path.expanduser(path))
     # --cwd on the main checkout: Herdr reuses the repo's parent workspace (even one that has not reported worktree
     # info yet) or creates it, so the helper never re-lists for it.
@@ -952,7 +1053,7 @@ def launch(path, label, name, kind, prompt, sleep=time.sleep):
         summary["note"] = "The worktree already had a workspace; reused it."
     start_error = None
     try:
-        herdr("agent", "start", name, "--kind", kind, "--pane", pane, "--timeout", "60000")
+        start_agent(name, kind, pane, sleep, busy_timeout_seconds)
     except HerdrError as error:
         # Herdr refuses an agent that blocks during startup, as it does at the folder-trust prompt.
         if "agent_not_ready" not in str(error):
@@ -1005,7 +1106,8 @@ def main(argv=None):
     ri = sub.add_parser("retire-info")
     ri.add_argument("target")
     la = sub.add_parser("land")
-    la.add_argument("target")
+    la.add_argument("target", nargs="?")
+    la.add_argument("--mr", help="the MR to land, by URL or group/project!iid, when it isn't the agent's branch's")
     la.add_argument("--timeout-minutes", type=int, default=30)
     wa = sub.add_parser("watch")
     wa.add_argument("agents", nargs="+")
@@ -1047,7 +1149,7 @@ def main(argv=None):
         elif args.command == "retire-info":
             print(json.dumps(retire_info(args.target), indent=2))
         elif args.command == "land":
-            print(json.dumps(land(args.target, args.timeout_minutes), indent=2))
+            print(json.dumps(land(args.target, args.timeout_minutes, mr=args.mr), indent=2))
         elif args.command == "watch":
             print(json.dumps(watch(args.agents, args.max_hours, args.poll_seconds), indent=2))
         elif args.command == "update-main":

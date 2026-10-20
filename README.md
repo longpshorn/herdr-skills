@@ -47,6 +47,8 @@ The plugin has no pinned version, so every commit here is a new version. Run `cl
 
    It stops and says why on anything unsafe: a failed or missing pipeline, conflicts, unresolved threads, a missing approval, uncommitted work, or open questions.
 
+An agent's MR doesn't have to be in the repo it works in. When its worktree branch has no MR, retire uses the one its status report names, and `herdr_tools.py land --mr <url or group/project!iid>` lands any MR directly, with the same checks.
+
 To land several agents as each becomes ready, run `herdr_tools.py watch <agent>...` (the retire skill shows how). It lands the first agent whose report says "ready to land" and then exits. An agent whose MR conflicts is asked once to rebase, and an MR waiting for an approval keeps waiting.
 
 ## The skills

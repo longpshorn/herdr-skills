@@ -146,9 +146,10 @@ class ParentWorkspace(unittest.TestCase):
 class FakeAgentHerdr:
     """Stands in for the `herdr` CLI around one agent: each `agent read` returns the next screen (the last repeats)."""
 
-    def __init__(self, screens=("> ",), statuses=("idle", "working"), start_error=None):
+    def __init__(self, screens=("> ",), statuses=("idle", "working"), start_error=None, start_errors=()):
         self.screens, self.statuses, self.calls = list(screens), list(statuses), []
         self.start_error = start_error
+        self.start_errors = list(start_errors)  # one per `agent start` call, None for success; then success
 
     def __call__(self, *args, parse=True):
         self.calls.append(args)
@@ -159,6 +160,11 @@ class FakeAgentHerdr:
         if args[:2] == ("agent", "get"):
             status = self.statuses.pop(0) if len(self.statuses) > 1 else self.statuses[0]
             return {"result": {"agent": {"agent_status": status}}}
+        if args[:2] == ("agent", "start") and self.start_errors:
+            error = self.start_errors.pop(0)
+            if error:
+                raise ht.HerdrError(error)
+            return {"result": {}}
         if args[:2] == ("agent", "start") and self.start_error:
             raise ht.HerdrError(self.start_error)
         if args[:2] in (("agent", "start"), ("agent", "prompt")):
@@ -231,6 +237,172 @@ class Launch(AgentHerdrTest):
         self.use(FakeAgentHerdr(start_error=AGENT_NOT_READY))
         with self.assertRaisesRegex(ht.HerdrError, "agent_not_ready"):
             self.launch()
+
+
+class LaunchWaitsForThePanesShell(AgentHerdrTest):
+    """A just-created workspace's pane may not have its shell yet: herdr refuses `agent start` with agent_pane_busy."""
+
+    def launch(self, timeout=30):
+        self.slept = []
+        return ht.launch(REPO + "-TICKET-2", "TICKET-2 x", "ticket2", "claude", "Read the brief",
+                         sleep=self.slept.append, busy_timeout_seconds=timeout)
+
+    def test_retries_a_busy_pane_with_backoff_then_starts_the_agent(self):
+        fake = self.use(FakeAgentHerdr(start_errors=[PANE_BUSY, PANE_BUSY, None]))
+        summary = self.launch()
+        self.assertEqual(len(fake.called("agent", "start")), 3)
+        self.assertEqual(summary["status"], "working")
+        self.assertEqual(len(self.slept[:2]), 2)
+        self.assertLess(self.slept[0], self.slept[1])
+
+    def test_gives_up_with_a_clear_error_when_the_shell_never_becomes_available(self):
+        self.use(FakeAgentHerdr(start_errors=[PANE_BUSY] * 100))
+        with self.assertRaisesRegex(ht.HerdrError, r"pane w8:p1 .*not ready.*within 5s"):
+            self.launch(timeout=5)
+        self.assertLessEqual(sum(s for s in self.slept), 5 + 5)
+
+
+class HerdrOutput(unittest.TestCase):
+    """The herdr wrapper never lets a Python traceback through: non-JSON output becomes a HerdrError."""
+
+    def setUp(self):
+        self.saved = ht.subprocess.run
+        self.addCleanup(setattr, ht.subprocess, "run", self.saved)
+
+    def respond(self, returncode, stdout, stderr=""):
+        class Done:
+            pass
+        done = Done()
+        done.returncode, done.stdout, done.stderr = returncode, stdout, stderr
+        ht.subprocess.run = lambda *a, **k: done
+
+    def test_non_json_output_is_reported_as_an_error(self):
+        self.respond(0, "Starting server...\n")
+        with self.assertRaisesRegex(ht.HerdrError, "not JSON.*Starting server"):
+            ht.herdr("agent", "list")
+
+    def test_a_failure_carries_herdrs_own_message(self):
+        self.respond(1, "", PANE_BUSY)
+        with self.assertRaisesRegex(ht.HerdrError, "agent_pane_busy"):
+            ht.herdr("agent", "start", "x")
+
+
+PANE_BUSY = ('{"error":{"code":"agent_pane_busy","message":"agent target pane w8:p1 is not an available shell"},'
+             '"id":"cli:agent:start"}')
+
+
+class ParseMrRef(unittest.TestCase):
+    def test_reads_gitlab_and_github_urls_and_the_short_form(self):
+        self.assertEqual(ht.parse_mr_ref("https://gitlab.com/example-org/apps/mobile-app/-/merge_requests/96"),
+                         {"forge": "gitlab", "host": "gitlab.com", "project": "example-org/apps/mobile-app", "iid": 96})
+        self.assertEqual(ht.parse_mr_ref("https://gitlab.com/g/p/-/merge_requests/7/diffs")["iid"], 7)
+        self.assertEqual(ht.parse_mr_ref("example-org/apps/mobile-app!96"),
+                         {"forge": "gitlab", "host": "gitlab.com", "project": "example-org/apps/mobile-app", "iid": 96})
+        self.assertEqual(ht.parse_mr_ref("https://github.com/owner/repo/pull/12"),
+                         {"forge": "github", "host": "github.com", "project": "owner/repo", "iid": 12})
+
+    def test_refuses_anything_else_by_name(self):
+        for bad in ("96", "!96", "https://gitlab.com/g/p", "https://example.com/x/pull/1", "none"):
+            with self.assertRaisesRegex(ht.HerdrError, "merge request"):
+                ht.parse_mr_ref(bad)
+
+
+class ReportMrRef(unittest.TestCase):
+    def report(self, mr):
+        return ht.parse_status_report(REPORT.replace("mr: https://gitlab.com/group/repo/-/merge_requests/7", "mr: " + mr))
+
+    def test_takes_the_first_merge_request_the_report_names(self):
+        ref = ht.report_mr_ref(self.report("https://gitlab.com/g/p/-/merge_requests/96, https://gitlab.com/g/q/-/merge_requests/3"))
+        self.assertEqual((ref["project"], ref["iid"]), ("g/p", 96))
+
+    def test_none_without_one(self):
+        self.assertIsNone(ht.report_mr_ref(self.report("none")))
+        self.assertIsNone(ht.report_mr_ref(None))
+
+
+class ForgeForAProject(unittest.TestCase):
+    """A forge bound to an MR's own project works from any directory: the MR may live in another repo."""
+
+    def setUp(self):
+        self.calls = []
+        self.saved = ht.run_json
+        ht.run_json = lambda args, cwd: self.calls.append(args) or {}
+        self.addCleanup(setattr, ht, "run_json", self.saved)
+
+    def test_gitlab_calls_name_the_project_and_host(self):
+        forge = ht.forge_for_ref(ht.parse_mr_ref("https://gitlab.com/g/sub/p/-/merge_requests/96"), "/anywhere")
+        forge.rebase(96)
+        self.assertIn("projects/g%2Fsub%2Fp/merge_requests/96/rebase", self.calls[0])
+        self.assertEqual(self.calls[0][self.calls[0].index("--hostname") + 1], "gitlab.com")
+
+    def test_without_a_project_gitlab_resolves_it_from_the_checkout(self):
+        ht.GitLabForge("/repo").rebase(5)
+        self.assertIn("projects/:fullpath/merge_requests/5/rebase", self.calls[0])
+
+    def test_github_calls_name_the_repository(self):
+        forge = ht.forge_for_ref(ht.parse_mr_ref("https://github.com/o/r/pull/4"), "/anywhere")
+        try:
+            forge.view(4)
+        except Exception:
+            pass
+        self.assertEqual(self.calls[0][self.calls[0].index("--repo") + 1], "o/r")
+
+
+class FakeViewForge:
+    def __init__(self, found=None, view=None):
+        self.found, self.viewed = found, view
+
+    def find(self, branch):
+        return self.found
+
+    def view(self, iid):
+        return self.viewed, False
+
+
+class ResolveMr(unittest.TestCase):
+    """retire-info and land use the worktree branch's MR, else the one the agent's report names (maybe another repo)."""
+
+    def report(self, mr):
+        return ht.parse_status_report(REPORT.replace("mr: https://gitlab.com/group/repo/-/merge_requests/7", "mr: " + mr))
+
+    def test_the_branchs_own_mr_wins(self):
+        branch_forge = FakeViewForge(found={"iid": 3, "state": "opened", "url": "u", "sha": "abc"})
+        mr, forge = ht.resolve_mr(branch_forge, "feat/x", self.report("https://gitlab.com/g/p/-/merge_requests/96"), "/w",
+                                  forge_factory=lambda ref, cwd: self.fail("the report's MR should not be read"))
+        self.assertEqual((mr["iid"], forge), (3, branch_forge))
+
+    def test_falls_back_to_the_mr_the_report_names_with_a_forge_for_its_project(self):
+        other = FakeViewForge(view={"state": "opened", "web_url": "https://gitlab.com/g/p/-/merge_requests/96", "sha": "def"})
+        made = []
+        mr, forge = ht.resolve_mr(FakeViewForge(), "feat/herdr-shareable",
+                                  self.report("https://gitlab.com/g/p/-/merge_requests/96"), "/w",
+                                  forge_factory=lambda ref, cwd: made.append(ref) or other)
+        self.assertIs(forge, other)
+        self.assertEqual(made[0]["project"], "g/p")
+        self.assertEqual((mr["iid"], mr["state"], mr["sha"], mr["ref"]), (96, "opened", "def", "g/p!96"))
+
+    def test_none_when_neither_has_one(self):
+        self.assertEqual(ht.resolve_mr(FakeViewForge(), "feat/x", self.report("none"), "/w")[0], None)
+        self.assertEqual(ht.resolve_mr(FakeViewForge(), None, None, "/w")[0], None)
+
+
+class LandAGivenMr(unittest.TestCase):
+    def setUp(self):
+        self.saved = ht.land_loop
+        self.looped = []
+        ht.land_loop = lambda forge, iid, timeout, poll: self.looped.append((forge, iid)) or {"state": "merged", "iid": iid}
+        self.addCleanup(setattr, ht, "land_loop", self.saved)
+
+    def test_lands_an_mr_named_by_url_or_short_form_with_a_forge_for_its_project(self):
+        ht.land(None, mr="https://gitlab.com/g/sub/p/-/merge_requests/96")
+        forge, iid = self.looped[0]
+        self.assertEqual((iid, forge.base, forge.host), (96, "projects/g%2Fsub%2Fp/merge_requests", "gitlab.com"))
+        ht.land(None, mr="g/p!5")
+        self.assertEqual(self.looped[1][1], 5)
+
+    def test_needs_an_agent_or_an_mr(self):
+        with self.assertRaisesRegex(ht.HerdrError, "--mr"):
+            ht.land(None)
 
 
 AGENT_NOT_READY = ('{"error":{"code":"agent_not_ready","message":"agent ticket2 is blocked during startup and is not '
