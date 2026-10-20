@@ -1,0 +1,11 @@
+{
+  "name": "acme-app (mine)",
+  "match": { "remote": "acme/acme-app" },
+  "planning": {
+    "artifact": "https://claude.ai/artifact/00000000-0000-0000-0000-000000000000",
+    "local_copy": "~/notes/acme-app-plan.html"
+  },
+  "mirrors": [
+    { "source": "docs/architecture.md", "copy": "~/notes/acme-app-architecture.md", "from": "## Components" }
+  ]
+}

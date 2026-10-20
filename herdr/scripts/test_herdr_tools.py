@@ -1207,6 +1207,35 @@ class SetupScan(unittest.TestCase):
                     self.assertTrue(os.path.isfile(os.path.join(full, name)), name)
 
 
+EXAMPLES = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "examples")
+
+
+class ExampleProfiles(unittest.TestCase):
+    """The examples are what people copy, so each must load through the same code a real profile does."""
+
+    def load(self, *parts):
+        with open(os.path.join(EXAMPLES, *parts)) as handle:
+            return json.load(handle)
+
+    def test_the_minimal_profile_is_a_github_repo_on_defaults(self):
+        resolved = ht.resolve_profile(self.load("minimal", ".claude", "herdr-profile.json"), "")
+        self.assertEqual((resolved["forge"], resolved["tracker"]["kind"]), ("github", "none"))
+
+    def test_the_full_profile_uses_gitlab_and_jira(self):
+        resolved = ht.resolve_profile(self.load("full", ".claude", "herdr-profile.json"), "")
+        self.assertEqual((resolved["forge"], resolved["tracker"]["kind"]), ("gitlab", "jira"))
+        self.assertIn("{branch}", resolved["worktree"]["new"])
+
+    def test_the_overlay_matches_a_repo_and_adds_only_personal_fields(self):
+        overlay = self.load("minimal", "overlay.example.json")
+        self.assertTrue(ht.select_profile([overlay], "/nowhere", "git@github.com:acme/acme-app.git"))
+        merged = ht.merge_profiles(self.load("minimal", ".claude", "herdr-profile.json"), overlay)
+        resolved = ht.resolve_profile(merged, "")
+        self.assertTrue(resolved["planning"])
+        self.assertTrue(resolved["mirrors"])
+        self.assertEqual(set(overlay) - {"name", "match"}, {"planning", "mirrors"})
+
+
 class Shareable(unittest.TestCase):
     """The plugin is shared: nothing in it may name one person or depend on one machine's checkout."""
 

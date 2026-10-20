@@ -20,3 +20,21 @@ jobs:
           python-version: "3.9"
       - name: Unit tests for herdr_tools.py
         run: python -m unittest discover -s herdr/scripts -p 'test_*.py' -v
+
+  example:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 5
+    defaults:
+      run:
+        working-directory: herdr/examples/full
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+      - name: Tests for the full example's scripts, hook and checks
+        run: npm test

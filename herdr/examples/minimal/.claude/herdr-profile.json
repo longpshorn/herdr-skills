@@ -1,0 +1,9 @@
+{
+  "name": "acme-app",
+  "forge": "github",
+  "brief": {
+    "notes": [
+      "Done means the test suite passes, the PR is open against main with checks green, and the branch is rebased on main."
+    ]
+  }
+}
