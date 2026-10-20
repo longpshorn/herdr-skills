@@ -46,9 +46,22 @@ export function checkSharedConcepts({ read, list }) {
     for (const name of exports.filter((name) => !exportsName(ownerSource, name))) {
       problems.push(`${concept}: ${owner} does not export ${name}`);
     }
+    // A tell-tale that can't compile, or that matches the empty string (and so every line), is reported instead of run.
+    const telltales = patterns.flatMap((pattern) => {
+      let regex;
+      try {
+        regex = new RegExp(pattern);
+      } catch (error) {
+        problems.push(`${concept}: tell-tale ${pattern} is not a valid regex (${error.message})`);
+        return [];
+      }
+      if (!regex.test('')) return [{ pattern, regex }];
+      problems.push(`${concept}: tell-tale ${pattern} matches the empty string, so it would flag every line`);
+      return [];
+    });
     for (const file of sources.filter((name) => name !== owner)) {
       (read(file) ?? '').split('\n').forEach((line, index) => {
-        for (const pattern of patterns.filter((p) => new RegExp(p).test(line))) {
+        for (const { pattern } of telltales.filter(({ regex }) => regex.test(line))) {
           problems.push(`${file}:${index + 1} re-lists ${concept} (${pattern}): use ${exports.join(', ')} from ${owner}`);
         }
       });
