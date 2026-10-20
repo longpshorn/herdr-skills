@@ -6,7 +6,7 @@ The herdr skills run the same flow on every project: spawn a ticket agent in its
 2. **A personal overlay:** the first `~/.config/herdr/profiles/*.json` whose `match` fits the repo (a substring of the `origin` URL, or the main checkout's path). Its fields replace the repo's; a field that is an object in both is merged one level deep (`brief.notes` from the overlay replaces the repo's list). Use it for what belongs to one person, such as their planning page and their copies of the repo's docs, or for a repo without a profile file.
 3. **The defaults** in the table below.
 
-A repo with neither file still works on the defaults. See what a repo resolves to: `sh "${CLAUDE_PLUGIN_ROOT}/scripts/herdr-tools" profile --path <repo>`. In its output, `defaulted` lists the fields that came from defaults and `sources` names the two files used.
+`/herdr:setup` proposes a repo's profile from [examples/minimal](examples/minimal) or [examples/full](examples/full), which also has a sample personal overlay. A repo with neither file still works on the defaults. See what a repo resolves to: `sh "${CLAUDE_PLUGIN_ROOT}/scripts/herdr-tools" profile --path <repo>`. In its output, `defaulted` lists the fields that came from defaults and `sources` names the two files used.
 
 | Field | Meaning | Default |
 | - | - | - |

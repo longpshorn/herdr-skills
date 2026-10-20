@@ -1,13 +1,15 @@
 # herdr-skills
 
+[![AgentAvow](https://agentavow.com/api/v1/public/scan/longpshorn/herdr-skills/badge)](https://agentavow.com/check/longpshorn/herdr-skills)
+
 Claude Code skills for running coding agents in [Herdr](https://herdr.dev), a terminal workspace manager for AI coding agents. The workflow is **one ticket, one worktree, one agent**: you hand a ticket to a new agent in its own git worktree, from a written brief. It plans, stops for your approval, builds test-first and opens an MR. When the MR is approved and green, `/herdr:retire` lands it, cleans up and captures the follow-ups. You stay in one orchestrating session and see every agent from it.
 
-This repository is a Claude Code plugin marketplace (`herdr-skills`) with one plugin, `herdr`, whose skills are `/herdr:status`, `/herdr:spawn`, `/herdr:ask`, `/herdr:peek`, `/herdr:run` and `/herdr:retire`.
+This repository is a Claude Code plugin marketplace (`herdr-skills`) with one plugin, `herdr`, whose skills are `/herdr:setup`, `/herdr:status`, `/herdr:spawn`, `/herdr:ask`, `/herdr:peek`, `/herdr:run` and `/herdr:retire`.
 
 ## Requirements
 
-- macOS. The skills have only been used on macOS so far.
-- [Herdr](https://herdr.dev) (`brew install herdr`), [Claude Code](https://claude.com/claude-code), `git` and `python3` (the macOS Command Line Tools one is enough).
+- macOS. The skills have only been used on macOS so far; their helper and the examples are tested on Linux, macOS and Windows.
+- [Herdr](https://herdr.dev) (`brew install herdr`), [Claude Code](https://claude.com/claude-code), `git`, and Python 3.9 or later as `python3`, `python` or `py -3` (the macOS Command Line Tools one is enough). The skills run the helper through `herdr/scripts/herdr-tools`, which picks the first that works.
 - The CLI for your forge: `glab` (GitLab) or `gh` (GitHub), signed in. For Jira tickets, `acli`, signed in.
 
 ## Install
@@ -27,8 +29,9 @@ The plugin has no pinned version, so every commit here is a new version. Run `cl
 ## Getting started
 
 1. Run `herdr` in a terminal. It starts (or reattaches to) a persistent session.
-2. In a Herdr pane, `cd` to your repo's main checkout and start `claude`. This is your orchestrating session. The skills refuse to run outside a Herdr pane.
-3. Run `/herdr:status`. With nothing running it says so.
+2. In a Herdr pane, `cd` to your repo's main checkout and start `claude`. This is your orchestrating session. The skills refuse to run outside a Herdr pane, except `/herdr:setup`.
+3. Run `/herdr:setup` once per repo. It proposes the repo's profile and lists the practices it lacks (below), and writes or copies only what you approve.
+4. Run `/herdr:status`. With nothing running it says so.
 
 ## The workflow
 
@@ -49,12 +52,15 @@ The plugin has no pinned version, so every commit here is a new version. Run `cl
 
 An agent's MR doesn't have to be in the repo it works in. When its worktree branch has no MR, retire uses the one its status report names, and `herdr_tools.py land --mr <url or group/project!iid>` lands any MR directly, with the same checks.
 
-To land several agents as each becomes ready, run `herdr_tools.py watch <agent>...` (the retire skill shows how). It lands the first agent whose report says "ready to land" and then exits. An agent whose MR conflicts is asked once to rebase, and an MR waiting for an approval keeps waiting.
+To land several agents in a set order, run `herdr_tools.py land <agent> <agent>...`. It lands each in turn. An agent whose MR conflicts is asked once to rebase, the rest carry on, and it is retried at the end. It prints one line per agent. To land whichever is ready first, run `herdr_tools.py watch <agent>...` (the retire skill shows how). It lands the first agent whose report says "ready to land" and then exits. An agent whose MR conflicts is asked once to rebase, and an MR waiting for an approval keeps waiting.
+
+Retire checks that the worktree's HEAD landed. When `land` rebased the MR first, the merged commit differs from HEAD, so it compares the change itself (`git patch-id`) with the squash or merge commit the forge reports, and says how it matched.
 
 ## The skills
 
 | Skill | Use it to |
 | - | - |
+| `/herdr:setup` | Propose a repo's profile and list the practices it lacks, from the examples; write or copy what you approve |
 | `/herdr:status` | See every agent, the ones needing you (`blocked`, `done`) first, with its workspace and what it is doing |
 | `/herdr:spawn <ticket>` | Start an agent on a ticket in its own worktree, from a brief |
 | `/herdr:peek <agent>` | Read what an agent is doing or asking, without sending it anything |
@@ -74,12 +80,20 @@ To land several agents as each becomes ready, run `herdr_tools.py watch <agent>.
 
 Each project describes itself in a profile: forge, tracker, worktree commands, dev server, and how its agents work and open MRs. The repo keeps it in `.claude/herdr-profile.json`. You can lay your own personal overlay over it in `~/.config/herdr/profiles/`. A repo without either still works on detected defaults. [herdr/PROFILES.md](herdr/PROFILES.md) explains the fields.
 
+## Examples
+
+The plugin works on any repo, but much of what makes parallel agents safe lives in the repo itself. Two examples, which `/herdr:setup` reads from, show it:
+
+- [`herdr/examples/minimal`](herdr/examples/minimal): one profile file for a GitHub repo, and a sample personal overlay. Enough for one person running a few agents.
+- [`herdr/examples/full`](herdr/examples/full): a small Node sample repo with every practice, each small and tested: a worktree command with per-worktree ports, the agent lifecycle in `CLAUDE.md`, a Stop hook that runs the checks, one owner per shared concept with a check, doc parity and docs-impact, MR and PR templates with "Docs reviewed", and a bootstrap that installs this plugin in each developer's own settings. Its README shows the GitHub variant.
+
 ## Development
 
-The skills are short; their deterministic parts live in `herdr/scripts/herdr_tools.py` (Python 3.9, no dependencies). Its unit tests run in CI:
+The skills are short; their deterministic parts live in `herdr/scripts/herdr_tools.py` (Python 3.9, no dependencies). CI runs its unit tests and the full example's tests on Linux, macOS and Windows:
 
 ```bash
 python3 -m unittest discover -s herdr/scripts -p 'test_*.py'
+(cd herdr/examples/full && npm test)
 ```
 
 To work on the skills, clone this repo and register the clone as a marketplace (`claude plugin marketplace add ./herdr-skills`). Claude Code reads a local marketplace in place, so a new session picks up your edits.
