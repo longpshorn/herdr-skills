@@ -7,7 +7,8 @@ on:
 
 jobs:
   helper:
-    strategy:
+    # The one OS matrix for this workflow; the example job reuses it as *os-matrix.
+    strategy: &os-matrix
       fail-fast: false
       matrix:
         # ubuntu-24.04, not ubuntu-latest: Python 3.9, the helper's floor, has no Ubuntu 26.04 build.
@@ -23,11 +24,7 @@ jobs:
         run: python -m unittest discover -s herdr/scripts -p 'test_*.py' -v
 
   example:
-    strategy:
-      fail-fast: false
-      matrix:
-        # ubuntu-24.04, not ubuntu-latest: Python 3.9, the helper's floor, has no Ubuntu 26.04 build.
-        os: [ubuntu-24.04, macos-latest, windows-latest]
+    strategy: *os-matrix
     runs-on: ${{ matrix.os }}
     timeout-minutes: 5
     defaults:
