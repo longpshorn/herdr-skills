@@ -841,6 +841,9 @@ class GitLabForge:
                 "url": merged.get("web_url")}
 
 
+DELETE_RETRY_SECONDS = 3  # GitHub can refuse the branch delete for a moment right after the merge
+
+
 class GitHubForge:
     """Pull requests through gh, normalized to the merge-request shape land_decision reads. With a repo (a PR named by
     URL) every call names it; without one gh resolves it from the main checkout."""
@@ -848,9 +851,10 @@ class GitHubForge:
     FIELDS = ("number,state,url,headRefOid,isDraft,mergeable,mergeStateStatus,statusCheckRollup,reviewDecision,"
               "mergeCommit")
 
-    def __init__(self, main_checkout, repo=None):
+    def __init__(self, main_checkout, repo=None, sleep=time.sleep):
         self.main = main_checkout
         self.repo_args = ["--repo", repo] if repo else []
+        self.sleep = sleep
 
     def find(self, branch):
         prs = run_json(["gh", "pr", "list", "--head", branch, "--state", "all", "--json", "number,state,url,headRefOid"]
@@ -883,13 +887,27 @@ class GitHubForge:
                 "commit": (pr.get("mergeCommit") or {}).get("oid"), "url": pr.get("url")}
 
     def delete_remote_branch(self, branch):
-        """A failure is a warning: the merge happened, and the repo's auto-delete may have removed the branch already."""
-        repo = self.repo_args[1] if self.repo_args else "{owner}/{repo}"
-        proc = subprocess.run(["gh", "api", "-X", "DELETE", "repos/%s/git/refs/heads/%s" % (repo, quote(branch))],
+        """A failed delete is retried once after a short wait, unless the branch is already gone (the repo's auto-delete
+        may have removed it). The same 422 can mean either, so the ref is checked. A last failure is a warning: the
+        merge happened."""
+        ref = "repos/%s/git/refs/heads/%s" % (self.api_repo(), quote(branch))
+        for attempt in range(2):
+            proc = subprocess.run(["gh", "api", "-X", "DELETE", ref], capture_output=True, text=True, cwd=self.main)
+            if proc.returncode == 0 or self.remote_branch_gone(branch):
+                return
+            if attempt == 0:
+                self.sleep(DELETE_RETRY_SECONDS)
+        print("warning: merged, but could not delete the remote branch %s: %s"
+              % (branch, (proc.stderr or proc.stdout).strip()), file=sys.stderr, flush=True)
+
+    def remote_branch_gone(self, branch):
+        """Only a 404 means gone; a failed check leaves the branch possibly there."""
+        proc = subprocess.run(["gh", "api", "repos/%s/git/ref/heads/%s" % (self.api_repo(), quote(branch))],
                               capture_output=True, text=True, cwd=self.main)
-        if proc.returncode != 0:
-            print("warning: merged, but could not delete the remote branch %s: %s"
-                  % (branch, (proc.stderr or proc.stdout).strip()), file=sys.stderr, flush=True)
+        return proc.returncode != 0 and "(HTTP 404)" in proc.stderr
+
+    def api_repo(self):
+        return self.repo_args[1] if self.repo_args else "{owner}/{repo}"
 
 
 def forge_for(profile):
