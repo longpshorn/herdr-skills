@@ -1136,5 +1136,96 @@ class LandLoop(unittest.TestCase):
         self.assertEqual((forge.rebased, forge.merged, result["rebased"]), (1, "def", True))
 
 
+class HeadLanded(unittest.TestCase):
+    """land rebases before merging, so the merged commit is rarely the worktree's HEAD: the same patch counts too."""
+
+    def test_says_how_head_matched_the_merge(self):
+        self.assertEqual(ht.head_landed_how("abc", "abc", False, None, None), "same commit")
+        self.assertEqual(ht.head_landed_how("abc", "def", True, None, None), "on the default branch")
+        self.assertEqual(ht.head_landed_how("abc", "def", False, "p1", "p1"), "same patch")
+
+    def test_none_when_nothing_matches(self):
+        self.assertIsNone(ht.head_landed_how("abc", "def", False, "p1", "p2"))
+        self.assertIsNone(ht.head_landed_how("abc", None, False, None, None))
+        self.assertIsNone(ht.head_landed_how("abc", "def", False, None, None))
+
+    def test_the_head_check_reports_how_it_matched(self):
+        check = checks_by_name(ht.retire_checks("idle", "", "merged", "same patch", ht.parse_status_report(REPORT)))["head"]
+        self.assertTrue(check["ok"])
+        self.assertIn("same patch", check["detail"])
+
+    def test_the_merged_commit_comes_from_either_forge(self):
+        self.assertEqual(ht.merged_commit({"squash_commit_sha": "sq", "merge_commit_sha": None}), "sq")
+        self.assertEqual(ht.merged_commit({"squash_commit_sha": None, "merge_commit_sha": "mc"}), "mc")
+        self.assertEqual(ht.merged_commit(ht.github_pr_to_mr(pr(state="MERGED", mergeCommit={"oid": "gh"}))), "gh")
+        self.assertIsNone(ht.merged_commit({}))
+
+
+def git_repo(test):
+    """A temporary repo with an `origin/main` ref, deleted after the test."""
+    path = tempfile.mkdtemp()
+    test.addCleanup(shutil.rmtree, path, ignore_errors=True)
+    def run(*args):
+        code, out = ht.git(path, "-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false", *args)
+        test.assertEqual(code, 0, (args, out))
+        return out
+    run("init", "-q", "-b", "main")
+    return path, run
+
+
+def write(path, name, text):
+    with open(os.path.join(path, name), "w") as handle:
+        handle.write(text)
+
+
+class PatchIds(unittest.TestCase):
+    def test_a_rebased_squash_has_the_same_patch_as_the_branch(self):
+        path, run = git_repo(self)
+        write(path, "a.txt", "one\ntwo\nthree\n")
+        run("add", "-A")
+        run("commit", "-qm", "base")
+        run("checkout", "-qb", "feature")
+        write(path, "a.txt", "one\ntwo\nthree\nfour\n")
+        run("commit", "-qam", "add four")
+        write(path, "b.txt", "new\n")
+        run("add", "-A")
+        run("commit", "-qm", "add b")
+        run("checkout", "-q", "main")
+        write(path, "c.txt", "someone else's work\n")
+        run("add", "-A")
+        run("commit", "-qm", "other merge")
+        run("merge", "--squash", "-q", "feature")
+        run("commit", "-qm", "feat: squashed")
+        squash = run("rev-parse", "HEAD")
+        run("update-ref", "refs/remotes/origin/main", "HEAD~1")  # the default branch before the squash landed
+        run("checkout", "-q", "feature")
+        branch = ht.branch_patch_id(path, "origin/main")
+        self.assertTrue(branch)
+        self.assertEqual(branch, ht.commit_patch_id(path, squash))
+        self.assertNotEqual(branch, ht.commit_patch_id(path, "main~1"))
+
+    def test_a_merge_commit_is_compared_against_its_first_parent(self):
+        path, run = git_repo(self)
+        write(path, "a.txt", "one\n")
+        run("add", "-A")
+        run("commit", "-qm", "base")
+        run("checkout", "-qb", "feature")
+        write(path, "a.txt", "one\ntwo\n")
+        run("commit", "-qam", "two")
+        run("checkout", "-q", "main")
+        write(path, "z.txt", "z\n")
+        run("add", "-A")
+        run("commit", "-qm", "other")
+        run("update-ref", "refs/remotes/origin/main", "HEAD")
+        run("merge", "--no-ff", "-q", "-m", "merge feature", "feature")
+        merge = run("rev-parse", "HEAD")
+        run("checkout", "-q", "feature")
+        self.assertEqual(ht.branch_patch_id(path, "origin/main"), ht.commit_patch_id(path, merge))
+
+    def test_an_unknown_commit_has_no_patch_id(self):
+        path, _ = git_repo(self)
+        self.assertIsNone(ht.commit_patch_id(path, "0" * 40))
+
+
 if __name__ == "__main__":
     unittest.main()

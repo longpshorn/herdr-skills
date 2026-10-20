@@ -177,10 +177,27 @@ def approval_detail(approval):
     return "needs %d approval%s from someone other than its author" % (left, "" if left == 1 else "s")
 
 
+def head_landed_how(head, mr_sha, on_default, branch_patch, merged_patch):
+    """How the worktree's HEAD landed, or None when it didn't. land rebases an MR that is behind before merging, so
+    the merged commit is usually not HEAD; the same patch (`git patch-id --stable`) then shows nothing was lost."""
+    if head and head == mr_sha:
+        return "same commit"
+    if on_default:
+        return "on the default branch"
+    if branch_patch and branch_patch == merged_patch:
+        return "same patch"
+    return None
+
+
+def merged_commit(mr):
+    """The commit a merged MR or PR put on its target: GitLab's squash or merge commit, or GitHub's merge commit."""
+    return mr.get("squash_commit_sha") or mr.get("merge_commit_sha")
+
+
 def retire_checks(agent_status, porcelain, mr_state, head_landed, report, worktree_removed=False, approval=None):
     """Every check /herdr:retire reports, in order. The workspace may be retired only when all are ok.
 
-    head_landed: the worktree's HEAD is the commit the MR merged, or is already on origin/main.
+    head_landed: how the worktree's HEAD landed (see head_landed_how), or a falsy value when it did not.
     worktree_removed: the worktree folder is already gone, so nothing local can be lost; the agent's report still gates.
     approval: an open MR's approval state (gitlab_approval's shape); None when there is no open MR to approve.
     """
@@ -203,8 +220,10 @@ def retire_checks(agent_status, porcelain, mr_state, head_landed, report, worktr
             check("merged", mr_state == "merged", "MR is %s" % (mr_state or "not found")),
             check(
                 "head",
-                head_landed,
-                "HEAD is the merged commit or on origin/main" if head_landed else "HEAD has commits the merge did not take",
+                bool(head_landed),
+                ("HEAD landed: %s" % head_landed if isinstance(head_landed, str) else
+                 "HEAD is the merged commit or on origin/main") if head_landed else
+                "HEAD has commits the merge did not take",
             ),
         ]
     if approval is None:
@@ -366,6 +385,7 @@ def github_pr_to_mr(pr):
         "blocking_discussions_resolved": True,
         "detailed_merge_status": merge_state,
         "head_pipeline": {"status": pipeline, "sha": sha},
+        "merge_commit_sha": (pr.get("mergeCommit") or {}).get("oid"),
     }
 
 
@@ -611,6 +631,27 @@ def git(path, *args):
     return proc.returncode, proc.stdout.strip()
 
 
+def patch_id(path, diff_args):
+    """`git patch-id --stable` of a diff, or None when the diff fails or is empty. Bytes throughout: a patch need not
+    be valid text in the locale's encoding."""
+    diff = subprocess.run(["git", "-C", path, *diff_args], capture_output=True)
+    if diff.returncode != 0 or not diff.stdout.strip():
+        return None
+    out = subprocess.run(["git", "-C", path, "patch-id", "--stable"], input=diff.stdout, capture_output=True).stdout
+    return out.split()[0].decode() if out.split() else None
+
+
+def branch_patch_id(path, default):
+    """The patch of everything the branch at PATH adds since it left DEFAULT."""
+    code, base = git(path, "merge-base", "HEAD", default)
+    return patch_id(path, ["diff", "--no-color", base, "HEAD"]) if code == 0 else None
+
+
+def commit_patch_id(path, commit):
+    """The patch COMMIT applied to its first parent: a squash commit's whole change, or a merge commit's branch."""
+    return patch_id(path, ["diff", "--no-color", commit + "^1", commit])
+
+
 def project_profile(main_checkout):
     """The resolved profile for the repo whose main checkout this is (see resolve_profile)."""
     remote = git(main_checkout, "remote", "get-url", "origin")[1]
@@ -668,7 +709,8 @@ class GitHubForge:
     """Pull requests through gh, normalized to the merge-request shape land_decision reads. With a repo (a PR named by
     URL) every call names it; without one gh resolves it from the main checkout."""
 
-    FIELDS = "number,state,url,headRefOid,isDraft,mergeable,mergeStateStatus,statusCheckRollup,reviewDecision"
+    FIELDS = ("number,state,url,headRefOid,isDraft,mergeable,mergeStateStatus,statusCheckRollup,reviewDecision,"
+              "mergeCommit")
 
     def __init__(self, main_checkout, repo=None):
         self.main = main_checkout
@@ -762,11 +804,18 @@ def retire_info(target):
     profile = project_profile(main_checkout)
     looks_like_branch = bool(branch) and " " not in branch
     mr, forge = resolve_mr(forge_for(profile), branch if looks_like_branch else None, report, main_checkout)
-    approval = forge.view(mr["iid"])[0]["approvals"] if mr and mr["state"] == "opened" else None
+    viewed = forge.view(mr["iid"])[0] if mr and mr["state"] in ("opened", "merged") else {}
+    approval = viewed["approvals"] if mr and mr["state"] == "opened" else None
     if not removed:
         default = git(main_checkout, "symbolic-ref", "--short", "refs/remotes/origin/HEAD")[1] or "origin/main"
         on_default = git(path, "merge-base", "--is-ancestor", "HEAD", default)[0] == 0
-        head_landed = on_default or bool(mr and mr.get("sha") == head)
+        branch_patch = merged_patch = None
+        merged = merged_commit(viewed)
+        if not on_default and merged and head != (mr or {}).get("sha"):
+            if git(path, "cat-file", "-e", merged + "^{commit}")[0] != 0:
+                git(main_checkout, "fetch", "-q", "origin", merged)
+            branch_patch, merged_patch = branch_patch_id(path, default), commit_patch_id(path, merged)
+        head_landed = head_landed_how(head, (mr or {}).get("sha"), on_default, branch_patch, merged_patch)
     return {
         "profile": profile["name"] or "(defaults)",
         "forge": profile["forge"],
