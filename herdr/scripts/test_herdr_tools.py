@@ -1115,6 +1115,88 @@ class Wrapper(unittest.TestCase):
         self.assertIn("python3, python, py -3", proc.stderr)
 
 
+class SetupScan(unittest.TestCase):
+    """What /herdr:setup reads off a repo: forge, tracker hints, package manager, and which practices it lacks."""
+
+    def repo(self, files):
+        path = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, path, ignore_errors=True)
+        for name, text in files.items():
+            os.makedirs(os.path.dirname(os.path.join(path, name)) or path, exist_ok=True)
+            write(path, name, text if isinstance(text, str) else json.dumps(text))
+        return path
+
+    def scan(self, files, remote="git@github.com:acme/app.git", history=()):
+        return ht.setup_scan(self.repo(files), remote, list(history))
+
+    def practices(self, result):
+        return {p["practice"]: p for p in result["practices"]}
+
+    def test_a_bare_github_repo_lacks_every_practice_and_gets_the_minimal_profile(self):
+        result = self.scan({"README.md": "# app\n"})
+        self.assertEqual(result["forge"], "github")
+        self.assertIsNone(result["tracker"])
+        self.assertEqual(result["closest_example"], "minimal")
+        self.assertEqual(result["proposed_profile"], {"name": os.path.basename(result["path"]), "forge": "github"})
+        practices = self.practices(result)
+        self.assertEqual(sorted(practices), sorted(["worktree", "agent_lifecycle", "stop_hook", "shared_concepts",
+                                                    "doc_checks", "mr_template", "personal_install"]))
+        self.assertFalse(any(p["present"] for p in practices.values()))
+        for practice in practices.values():
+            self.assertTrue(practice["why"])
+            self.assertTrue(practice["copy"], practice["practice"])
+        self.assertIn(".github/pull_request_template.md", practices["mr_template"]["copy"])
+
+    def test_ticket_keys_in_branches_and_commits_suggest_a_jira_tracker(self):
+        result = self.scan({}, remote="https://gitlab.example.com/acme/app.git",
+                           history=["feat/ACME-12-login", "fix: ACME-15 crash", "chore: deps", "feat/OTHER-1-x"])
+        self.assertEqual(result["tracker"], {"kind": "jira", "project": "ACME"})
+        self.assertEqual(result["closest_example"], "full")
+        self.assertEqual(result["proposed_profile"]["tracker"]["project"], "ACME")
+        self.assertEqual(result["forge"], "gitlab")
+        self.assertIn(".gitlab/merge_request_templates/Default.md", self.practices(result)["mr_template"]["copy"])
+
+    def test_a_single_ticket_key_is_not_a_tracker(self):
+        self.assertIsNone(self.scan({}, history=["feat/ACME-12-login", "chore: deps"])["tracker"])
+
+    def test_reads_the_package_manager_and_its_scripts_into_the_profile(self):
+        result = self.scan({"pnpm-lock.yaml": "", "package.json": {"scripts": {
+            "dev": "vite", "worktree": "node scripts/worktree.mjs"}}})
+        self.assertEqual(result["package_manager"], "pnpm")
+        profile = result["proposed_profile"]
+        self.assertEqual(profile["dev_server"], {"command": "pnpm dev"})
+        self.assertEqual(profile["worktree"], {"new": "pnpm worktree new {branch}", "remove": "pnpm worktree remove {branch}"})
+        self.assertTrue(self.practices(result)["worktree"]["present"])
+
+    def test_spots_the_practices_a_repo_already_has(self):
+        practices = self.practices(self.scan({
+            "CLAUDE.md": "# App\n\n## Development lifecycle (agents)\nNever merge.\n",
+            ".claude/settings.json": {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "x"}]}]}},
+            "docs/shared-concepts.md": "## Registry\n",
+            "package.json": {"scripts": {"docs:impact": "node scripts/docs-impact.mjs"}},
+            ".github/pull_request_template.md": "## Docs reviewed\n",
+            "scripts/bootstrap.mjs": "install('herdr@herdr-skills')",
+        }))
+        self.assertEqual([name for name, p in practices.items() if not p["present"]], ["worktree"])
+
+    def test_flags_the_plugin_in_the_projects_committed_settings(self):
+        result = self.scan({".claude/settings.json": {"enabledPlugins": {"herdr@herdr-skills": True}}})
+        self.assertTrue(result["plugin_in_committed_settings"])
+        self.assertFalse(self.scan({})["plugin_in_committed_settings"])
+
+    def test_reports_an_existing_profile_instead_of_proposing_one(self):
+        result = self.scan({".claude/herdr-profile.json": {"name": "app", "forge": "github"}})
+        self.assertTrue(result["profile"].endswith("herdr-profile.json"))
+        self.assertIsNone(result["proposed_profile"])
+
+    def test_every_file_it_suggests_copying_exists_in_the_full_example(self):
+        full = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "examples", "full")
+        for forge in ("github", "gitlab"):
+            for practice in ht.setup_scan(self.repo({}), "git@%s.com:a/b.git" % forge, [])["practices"]:
+                for name in practice["copy"]:
+                    self.assertTrue(os.path.isfile(os.path.join(full, name)), name)
+
+
 class Shareable(unittest.TestCase):
     """The plugin is shared: nothing in it may name one person or depend on one machine's checkout."""
 

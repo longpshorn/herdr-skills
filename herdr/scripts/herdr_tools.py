@@ -36,6 +36,9 @@
   herdr_tools.py main-server start|restart|status --path REPO [--command CMD]
       Run the main checkout's dev server (its profile's dev_server.command) in a Herdr pane labelled
       "main dev server", restart it, or report it.
+  herdr_tools.py setup-scan --path REPO
+      For /herdr:setup (and outside Herdr too): the repo's forge, a tracker guessed from its ticket keys, its package
+      manager, which practices from examples/full it has, and a proposed profile when it has none.
   herdr_tools.py profile --path REPO
       The project's resolved profile: the repo's .claude/herdr-profile.json, with a personal overlay from
       ~/.config/herdr/profiles/ (matched by origin URL or path) laid over it, over the defaults.
@@ -354,6 +357,132 @@ def load_profile(main_checkout, remote_url, overlay_dir=OVERLAY_DIR):
                 sources["overlay"] = path
                 break
     return profile, sources
+
+
+# ---- /herdr:setup: what a repo has, and what it lacks ------------------------------------------------------------
+# Each practice the examples/full sample repo shows: why it matters, and the files to copy from it.
+
+PRACTICES = [
+    ("worktree", "A worktree command gives each agent its own checkout, bootstrapped, with its own ports, so parallel "
+                 "agents never share a dev server or node_modules.",
+     ["scripts/worktree.mjs", "scripts/lib/worktree.mjs", "scripts/lib/worktree.test.mjs"]),
+    ("agent_lifecycle", "Agents follow the repo's CLAUDE.md: test first, never merge, rebase and hand over, run the "
+                        "doc check. Without it each agent improvises its own process.",
+     ["CLAUDE.md"]),
+    ("stop_hook", "A Stop hook runs the project's checks before an agent may finish, so it can't hand over red work.",
+     [".claude/settings.json", ".claude/hooks/verify-on-stop.mjs", "scripts/lib/stop-hook.test.mjs"]),
+    ("shared_concepts", "A registry gives each shared rule or value set one owner, and its check fails when another "
+                        "file re-lists the values. Parallel agents otherwise each build their own copy.",
+     ["docs/shared-concepts.md", "scripts/lib/shared-concepts.mjs", "scripts/lib/shared-concepts.test.mjs"]),
+    ("doc_checks", "A doc-parity check fails the build when docs name commands or files that no longer exist, and "
+                   "docs-impact lists the docs a change may have made untrue.",
+     ["scripts/lib/doc-parity.mjs", "scripts/lib/doc-parity.test.mjs", "scripts/docs-impact.mjs",
+      "scripts/lib/docs-impact.mjs", "scripts/lib/docs-impact.test.mjs"]),
+    ("mr_template", "An MR or PR template with a \"Docs reviewed\" section makes the agent record each doc it reread.",
+     None),
+    ("personal_install", "Bootstrap installs the herdr plugin into each developer's own settings when it is missing, "
+                         "never into the project's committed settings.",
+     ["scripts/bootstrap.mjs", "scripts/lib/herdr-plugin.mjs", "scripts/lib/herdr-plugin.test.mjs"]),
+]
+MR_TEMPLATE = {"github": ".github/pull_request_template.md", "gitlab": ".gitlab/merge_request_templates/Default.md"}
+MR_TEMPLATE_GLOBS = [".gitlab/merge_request_templates/*.md", ".github/pull_request_template.md",
+                     ".github/PULL_REQUEST_TEMPLATE.md", ".github/PULL_REQUEST_TEMPLATE/*.md",
+                     "docs/pull_request_template.md", "pull_request_template.md"]
+LOCKFILES = [("pnpm-lock.yaml", "pnpm"), ("yarn.lock", "yarn"), ("bun.lock", "bun"), ("bun.lockb", "bun"),
+             ("package-lock.json", "npm"), ("package.json", "npm"), ("uv.lock", "uv"), ("poetry.lock", "poetry"),
+             ("pyproject.toml", "pip"), ("requirements.txt", "pip"), ("go.mod", "go"), ("Cargo.toml", "cargo")]
+RUN_SCRIPT = {"npm": "npm run %s", "pnpm": "pnpm %s", "yarn": "yarn %s", "bun": "bun run %s"}
+TICKET_KEY = re.compile(r"\b([A-Z][A-Z0-9]+)-\d+\b")
+
+
+def setup_scan(path, remote, history):
+    """What /herdr:setup proposes for the repo at PATH: its forge (from the origin URL), a tracker guessed from ticket
+    keys in HISTORY (branch names and commit subjects), its package manager, each practice from examples/full with
+    whether the repo has it, and a profile from the closest example (None when the repo has one)."""
+    def read(name):
+        try:
+            with open(os.path.join(path, name), encoding="utf-8", errors="replace") as handle:
+                return handle.read()
+        except OSError:
+            return None
+
+    def files_under(*folders):
+        for folder in folders:
+            for root, dirs, names in os.walk(os.path.join(path, folder)):
+                dirs[:] = [d for d in dirs if d not in ("node_modules", ".git")]
+                for name in names:
+                    yield os.path.relpath(os.path.join(root, name), path).replace(os.sep, "/")
+
+    def json_file(name):
+        try:
+            return json.loads(read(name) or "{}")
+        except ValueError:
+            return {}
+
+    forge = forge_from_remote(remote)
+    keys = {}
+    for line in history:
+        for key in set(TICKET_KEY.findall(line)):
+            keys[key] = keys.get(key, 0) + 1
+    project = max(keys, key=lambda k: keys[k]) if keys else None
+    tracker = {"kind": "jira", "project": project} if project and keys[project] >= 2 else None
+    manager = next((pm for name, pm in LOCKFILES if os.path.isfile(os.path.join(path, name))), None)
+    scripts = json_file("package.json").get("scripts") or {}
+    settings = json_file(os.path.join(".claude", "settings.json"))
+    script_files = list(files_under("scripts", "bin"))
+    top_files = [n for n in os.listdir(path) if os.path.isfile(os.path.join(path, n))]
+    guide = (read("CLAUDE.md") or "") + (read("AGENTS.md") or "")
+    templates = [n for n in list(files_under(".gitlab", ".github", "docs")) + top_files
+                 if any(fnmatch.fnmatch(n, g) for g in MR_TEMPLATE_GLOBS)]
+    installers = [n for n in script_files + top_files
+                  if not n.endswith(".md") and "herdr@herdr-skills" in (read(n) or "")]  # docs only describe it
+
+    present = {
+        "worktree": any("worktree" in s for s in scripts) or any("worktree" in n.lower() for n in script_files)
+                    or bool(re.search(r"(?m)^worktree[\w-]*:", read("Makefile") or "")),
+        "agent_lifecycle": bool(re.search(r"(?im)^#{1,6} .*lifecycle", guide)),
+        "stop_hook": bool((settings.get("hooks") or {}).get("Stop")),
+        "shared_concepts": os.path.isfile(os.path.join(path, "docs", "shared-concepts.md")),
+        "doc_checks": any(s.startswith("docs") for s in scripts)
+                      or any(re.search(r"doc-parity|docs-impact", n) for n in script_files),
+        "mr_template": any("docs reviewed" in (read(n) or "").lower() for n in templates),
+        "personal_install": bool(installers),
+    }
+    evidence = {"mr_template": "templates: %s" % ", ".join(templates) if templates else "no template",
+                "personal_install": ", ".join(installers)}
+    practices = [{"practice": name, "present": present[name], "why": why,
+                  "copy": copy or [MR_TEMPLATE.get(forge or "github", MR_TEMPLATE["github"])],
+                  "evidence": evidence.get(name, "")} for name, why, copy in PRACTICES]
+    plugins = settings.get("enabledPlugins") or {}
+    in_settings = any(k.startswith("herdr@") for k in plugins) or "herdr-skills" in (settings.get(
+        "extraKnownMarketplaces") or {})
+
+    profile_path = os.path.join(path, REPO_PROFILE)
+    proposed = None
+    if not os.path.isfile(profile_path):
+        proposed = {"name": os.path.basename(os.path.abspath(path)), "forge": forge}
+        if tracker:
+            proposed["tracker"] = dict(tracker)
+        run = RUN_SCRIPT.get(manager)
+        if run and "worktree" in scripts:
+            proposed["worktree"] = {"new": run % "worktree new {branch}", "remove": run % "worktree remove {branch}"}
+        dev = next((s for s in ("dev", "start") if s in scripts), None)
+        if run and dev:
+            proposed["dev_server"] = {"command": run % dev}
+    return {
+        "path": os.path.abspath(path), "remote": remote, "forge": forge, "tracker": tracker,
+        "package_manager": manager, "profile": profile_path if proposed is None else None,
+        "closest_example": "full" if tracker or forge == "gitlab" else "minimal",
+        "proposed_profile": proposed, "plugin_in_committed_settings": in_settings, "practices": practices,
+    }
+
+
+def scan_repo(path):
+    """setup_scan for the repo PATH is in, with its origin URL and the ticket keys its branches and commits use."""
+    root = repo_root(path)
+    history = git(root, "for-each-ref", "--format=%(refname:short)", "refs/heads", "refs/remotes")[1].splitlines()
+    history += git(root, "log", "-200", "--format=%s")[1].splitlines()
+    return setup_scan(root, git(root, "remote", "get-url", "origin")[1], history)
 
 
 def github_pr_to_mr(pr):
@@ -1219,11 +1348,20 @@ def main(argv=None):
     ms.add_argument("--command", dest="server_command", default=None)
     pf = sub.add_parser("profile")
     pf.add_argument("--path", required=True)
+    ss = sub.add_parser("setup-scan")
+    ss.add_argument("--path", required=True)
     sm = sub.add_parser("sync-mirrors")
     sm.add_argument("--path", required=True)
     sm.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
 
+    if args.command == "setup-scan":  # reads a repo only, so it also works outside Herdr
+        try:
+            print(json.dumps(scan_repo(args.path), indent=2))
+        except HerdrError as error:
+            print(str(error), file=sys.stderr)
+            return 1
+        return 0
     if os.environ.get("HERDR_ENV") != "1":
         print("Not running inside a Herdr-managed pane (HERDR_ENV != 1); refusing to control Herdr.", file=sys.stderr)
         return 2
