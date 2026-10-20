@@ -40,3 +40,12 @@ jobs:
           node-version: "24"
       - name: Tests for the full example's scripts, hook and checks
         run: npm test
+
+  retry-workflow:
+    # The retry workflow only runs on ubuntu, from main; this tests its retry step on every PR.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - name: Tests for the retry-unacquired workflow
+        run: python3 -m unittest discover -s .github/tests -p 'test_*.py' -v
