@@ -96,6 +96,8 @@ python3 -m unittest discover -s herdr/scripts -p 'test_*.py'
 (cd herdr/examples/full && npm test)
 ```
 
+When a CI job is cancelled because no hosted runner picked it up (most often on macOS), `.github/workflows/retry-unacquired.yml` re-runs the failed jobs, at most twice. A job that fails its tests is never the trigger.
+
 To work on the skills, clone this repo and register the clone as a marketplace (`claude plugin marketplace add ./herdr-skills`). Claude Code reads a local marketplace in place, so a new session picks up your edits.
 
 ## License
