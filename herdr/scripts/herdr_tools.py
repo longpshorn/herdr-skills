@@ -522,6 +522,7 @@ def github_pr_to_mr(pr):
         "detailed_merge_status": merge_state,
         "head_pipeline": {"status": pipeline, "sha": sha},
         "merge_commit_sha": (pr.get("mergeCommit") or {}).get("oid"),
+        "source_branch": pr.get("headRefName"),
     }
 
 
@@ -834,14 +835,15 @@ class GitLabForge:
     def rebase(self, iid):
         self.api("%s/%d/rebase" % (self.base, iid), "PUT")
 
-    def merge(self, iid, sha):
+    def merge(self, iid, sha, branch):
+        """Squash-merge pinned to SHA; GitLab deletes the source branch itself, so `branch` is unused."""
         merged = self.api("%s/%d/merge" % (self.base, iid), "PUT",
                           [("sha", sha), ("squash", "true"), ("should_remove_source_branch", "true")])
         return {"state": merged.get("state"), "commit": merged.get("squash_commit_sha") or merged.get("merge_commit_sha"),
                 "url": merged.get("web_url")}
 
 
-DELETE_RETRY_SECONDS = 3  # GitHub can refuse the branch delete for a moment right after the merge
+GITHUB_RETRY_SECONDS = 3  # the wait before retrying a GitHub call that failed right after a merge
 
 
 class GitHubForge:
@@ -849,7 +851,7 @@ class GitHubForge:
     URL) every call names it; without one gh resolves it from the main checkout."""
 
     FIELDS = ("number,state,url,headRefOid,isDraft,mergeable,mergeStateStatus,statusCheckRollup,reviewDecision,"
-              "mergeCommit")
+              "mergeCommit,headRefName")
 
     def __init__(self, main_checkout, repo=None, sleep=time.sleep):
         self.main = main_checkout
@@ -873,18 +875,33 @@ class GitHubForge:
         subprocess.run(["gh", "pr", "update-branch", str(iid), "--rebase"] + self.repo_args, capture_output=True,
                        text=True, cwd=self.main)
 
-    def merge(self, iid, sha):
-        """Squash-merge pinned to SHA, then delete only the remote branch, as GitLab's should_remove_source_branch does.
-        Not gh's --delete-branch: it also deletes the local branch and the agent's worktree, which retire removes."""
+    def merge(self, iid, sha, branch):
+        """Squash-merge pinned to SHA, then delete only the remote BRANCH (the PR's head as read before the merge), as
+        GitLab's should_remove_source_branch does. Not gh's --delete-branch: it also deletes the local branch and the
+        agent's worktree, which retire removes. Once gh pr merge succeeds nothing raises: the merge happened."""
         proc = subprocess.run(["gh", "pr", "merge", str(iid), "--squash", "--match-head-commit", sha] + self.repo_args,
                               capture_output=True, text=True, cwd=self.main)
         if proc.returncode != 0:
             raise HerdrError("gh pr merge failed: %s" % (proc.stderr or proc.stdout).strip())
-        pr = run_json(["gh", "pr", "view", str(iid), "--json", "state,url,mergeCommit,headRefName"] + self.repo_args,
-                      self.main)
-        self.delete_remote_branch(pr.get("headRefName"))
+        self.delete_remote_branch(branch)
+        pr = self.read_merged(iid)
         return {"state": {"MERGED": "merged"}.get(pr.get("state"), pr.get("state")),
                 "commit": (pr.get("mergeCommit") or {}).get("oid"), "url": pr.get("url")}
+
+    def read_merged(self, iid):
+        """The merged PR's state, url and merge commit, read once more after a short wait if the first read fails. A
+        last failure is a warning, and the PR counts as merged with its commit unknown."""
+        for attempt in range(2):
+            try:
+                return run_json(["gh", "pr", "view", str(iid), "--json", "state,url,mergeCommit"] + self.repo_args,
+                                self.main) or {}
+            except HerdrError as error:
+                failure = error
+                if attempt == 0:
+                    self.sleep(GITHUB_RETRY_SECONDS)
+        print("warning: merged, but could not read the merge commit of #%d: %s" % (iid, failure), file=sys.stderr,
+              flush=True)
+        return {"state": "MERGED"}
 
     def delete_remote_branch(self, branch):
         """A failed delete is retried once after a short wait, unless the branch is already gone (the repo's auto-delete
@@ -896,7 +913,7 @@ class GitHubForge:
             if proc.returncode == 0 or self.remote_branch_gone(branch):
                 return
             if attempt == 0:
-                self.sleep(DELETE_RETRY_SECONDS)
+                self.sleep(GITHUB_RETRY_SECONDS)
         print("warning: merged, but could not delete the remote branch %s: %s"
               % (branch, (proc.stderr or proc.stdout).strip()), file=sys.stderr, flush=True)
 
@@ -1030,8 +1047,9 @@ def land_loop(forge, iid, timeout_seconds, poll_seconds=20, sleep=time.sleep, ma
             if decision["action"] == "stop":
                 raise HerdrError("Not landing !%d: %s." % (iid, decision["reason"]))
             if decision["action"] == "merge":
-                merged = forge.merge(iid, mr["sha"])
-                return dict(merged, iid=iid, rebased=rebased_from is not None)
+                merged = forge.merge(iid, mr["sha"], mr.get("source_branch"))
+                return dict(merged, iid=iid, url=merged.get("url") or mr.get("web_url"),
+                            rebased=rebased_from is not None)
             if decision["action"] == "rebase" and rebased_from != mr["sha"]:
                 forge.rebase(iid)
                 rebased_from = mr["sha"]
