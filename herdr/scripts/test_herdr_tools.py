@@ -1319,6 +1319,9 @@ class GitHubNormalization(unittest.TestCase):
         self.assertEqual(self.action(state="CLOSED"), "stop")
         self.assertEqual(self.action(state="MERGED"), "done")
 
+    def test_the_head_branch_is_the_source_branch(self):
+        self.assertEqual(ht.github_pr_to_mr(pr(headRefName="feat/x"))["source_branch"], "feat/x")
+
 
 class GitHubMerge(unittest.TestCase):
     """Landing a PR leaves the agent's local branch and worktree to retire (gh's --delete-branch removes both), and
@@ -1335,11 +1338,18 @@ class GitHubMerge(unittest.TestCase):
         self.gh_calls, self.delete_fails, self.fail_merge, self.sleeps = [], False, False, []
         self.deletes = []  # (returncode, stderr) per DELETE, in order; then delete_fails decides
         self.ref_check = (1, "gh: Unprocessable Entity (HTTP 422)")
+        self.read_failures = 0  # reads after the merge that fail before one succeeds
         real_run = subprocess.run
         def fake_run(args, **kw):
             if args[0] != "gh":
                 return real_run(args, **kw)
             self.gh_calls.append(args)
+            if args[1:3] == ["pr", "view"] and ht.GitHubForge.FIELDS in args:
+                out = json.dumps(pr(number=4, url="https://github.com/o/r/pull/4", headRefName="feat/x"))
+                return subprocess.CompletedProcess(args, 0, out, "")
+            if args[1:3] == ["pr", "view"] and self.read_failures:
+                self.read_failures -= 1
+                return subprocess.CompletedProcess(args, 1, "", "error connecting to api.github.com: TLS handshake timeout")
             if args[1:3] == ["pr", "view"]:
                 out = json.dumps({"state": "MERGED", "url": "https://github.com/o/r/pull/4",
                                   "mergeCommit": {"oid": "m1"}, "headRefName": "feat/x"})
@@ -1364,7 +1374,7 @@ class GitHubMerge(unittest.TestCase):
         return ht.GitHubForge(self.main, repo, sleep=self.sleeps.append)
 
     def test_leaves_the_worktree_and_local_branch_for_retire(self):
-        result = ht.GitHubForge(self.main).merge(4, "abc")
+        result = ht.GitHubForge(self.main).merge(4, "abc", "feat/x")
         self.assertEqual(result, {"state": "merged", "commit": "m1", "url": "https://github.com/o/r/pull/4"})
         self.assertTrue(os.path.isdir(self.worktree))
         listed = [os.path.realpath(line[len("worktree "):]) for line in
@@ -1376,39 +1386,39 @@ class GitHubMerge(unittest.TestCase):
         self.assertEqual(merge[merge.index("--match-head-commit") + 1], "abc")
 
     def test_deletes_only_the_remote_branch(self):
-        ht.GitHubForge(self.main).merge(4, "abc")
+        ht.GitHubForge(self.main).merge(4, "abc", "feat/x")
         self.assertEqual(self.gh("api"), [["gh", "api", "-X", "DELETE", "repos/{owner}/{repo}/git/refs/heads/feat/x"]])
 
     def test_a_pr_in_another_repo_deletes_that_repos_branch(self):
-        ht.GitHubForge(self.main, "o/r").merge(4, "abc")
+        ht.GitHubForge(self.main, "o/r").merge(4, "abc", "feat/x")
         self.assertEqual(self.gh("api")[0][-1], "repos/o/r/git/refs/heads/feat/x")
 
     def test_a_failed_remote_delete_is_a_warning_after_the_merge(self):
         self.delete_fails = True
         self.ref_check = (0, "")
         with contextlib.redirect_stderr(io.StringIO()) as err:
-            result = self.forge().merge(4, "abc")
+            result = self.forge().merge(4, "abc", "feat/x")
         self.assertEqual(result, {"state": "merged", "commit": "m1", "url": "https://github.com/o/r/pull/4"})
         self.assertIn("feat/x", err.getvalue())
         self.assertIn("Reference does not exist", err.getvalue())
         self.assertEqual(len(self.gh("api", "-X", "DELETE")), 2)
-        self.assertEqual(self.sleeps, [ht.DELETE_RETRY_SECONDS])
+        self.assertEqual(self.sleeps, [ht.GITHUB_RETRY_SECONDS])
 
     def test_a_transient_422_is_retried_once_after_a_short_wait(self):
         self.deletes = [(1, "gh: Reference does not exist (HTTP 422)"), (0, "")]
         self.ref_check = (0, "")
         with contextlib.redirect_stderr(io.StringIO()) as err:
-            self.forge("o/r").merge(4, "abc")
+            self.forge("o/r").merge(4, "abc", "feat/x")
         self.assertEqual(err.getvalue(), "")
         self.assertEqual(len(self.gh("api", "-X", "DELETE")), 2)
-        self.assertEqual(self.sleeps, [ht.DELETE_RETRY_SECONDS])
+        self.assertEqual(self.sleeps, [ht.GITHUB_RETRY_SECONDS])
         self.assertIn(["gh", "api", "repos/o/r/git/ref/heads/feat/x"], self.gh("api"))
 
     def test_a_branch_already_gone_is_success_without_waiting(self):
         self.deletes = [(1, "gh: Reference does not exist (HTTP 422)")]
         self.ref_check = (1, "gh: Not Found (HTTP 404)")
         with contextlib.redirect_stderr(io.StringIO()) as err:
-            self.forge().merge(4, "abc")
+            self.forge().merge(4, "abc", "feat/x")
         self.assertEqual(err.getvalue(), "")
         self.assertEqual(len(self.gh("api", "-X", "DELETE")), 1)
         self.assertEqual(self.sleeps, [])
@@ -1417,16 +1427,60 @@ class GitHubMerge(unittest.TestCase):
         self.deletes = [(1, "gh: Server Error (HTTP 502)"), (0, "")]
         self.ref_check = (1, "gh: Server Error (HTTP 502)")
         with contextlib.redirect_stderr(io.StringIO()) as err:
-            self.forge().merge(4, "abc")
+            self.forge().merge(4, "abc", "feat/x")
         self.assertEqual(err.getvalue(), "")
         self.assertEqual(len(self.gh("api", "-X", "DELETE")), 2)
-        self.assertEqual(self.sleeps, [ht.DELETE_RETRY_SECONDS])
+        self.assertEqual(self.sleeps, [ht.GITHUB_RETRY_SECONDS])
 
     def test_a_failed_merge_raises_and_deletes_nothing(self):
         self.fail_merge = True
         with self.assertRaisesRegex(ht.HerdrError, "gh pr merge failed"):
-            ht.GitHubForge(self.main).merge(4, "abc")
+            ht.GitHubForge(self.main).merge(4, "abc", "feat/x")
         self.assertEqual(self.gh("api"), [])
+
+    def test_the_delete_uses_the_branch_read_before_the_merge(self):
+        self.forge().merge(4, "abc", "feat/y")
+        self.assertEqual(self.gh("api", "-X", "DELETE")[0][-1], "repos/{owner}/{repo}/git/refs/heads/feat/y")
+
+    def test_a_failed_read_after_the_merge_is_retried_once(self):
+        self.read_failures = 1
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            result = self.forge().merge(4, "abc", "feat/x")
+        self.assertEqual(result, {"state": "merged", "commit": "m1", "url": "https://github.com/o/r/pull/4"})
+        self.assertEqual(err.getvalue(), "")
+        self.assertEqual(len(self.gh("pr", "view")), 2)
+        self.assertEqual(self.sleeps, [ht.GITHUB_RETRY_SECONDS])
+
+    def test_a_read_that_keeps_failing_still_reports_the_merge(self):
+        self.read_failures = 2
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            result = self.forge().merge(4, "abc", "feat/x")
+        self.assertEqual(result, {"state": "merged", "commit": None, "url": None})
+        self.assertIn("warning: merged", err.getvalue())
+        self.assertIn("TLS handshake timeout", err.getvalue())
+        self.assertEqual(len(self.gh("pr", "view")), 2)
+        self.assertEqual(self.gh("api", "-X", "DELETE")[0][-1], "repos/{owner}/{repo}/git/refs/heads/feat/x")
+
+    def land(self):
+        return ht.land_loop(self.forge(), 4, timeout_seconds=60, poll_seconds=0, sleep=lambda s: None)
+
+    def test_a_single_land_whose_read_fails_reports_merged_with_the_pr_url(self):
+        self.read_failures = 2
+        with contextlib.redirect_stderr(io.StringIO()):
+            result = self.land()
+        self.assertEqual((result["state"], result["commit"], result["url"]),
+                         ("merged", None, "https://github.com/o/r/pull/4"))
+        self.assertEqual(self.gh("api", "-X", "DELETE")[0][-1], "repos/{owner}/{repo}/git/refs/heads/feat/x")
+
+    def test_landing_several_goes_on_after_a_failed_read(self):
+        def land_fn(agent):
+            self.read_failures = 2 if agent == "a" else 0
+            return self.land()
+        with contextlib.redirect_stderr(io.StringIO()):
+            results = ht.land_queue(["a", "b", "c"], land_fn, lambda agent, message: None, max_seconds=10)
+        self.assertEqual([(r["agent"], r["result"], r["detail"]) for r in results],
+                         [("a", "merged", "!4 merged"), ("b", "merged", "!4 merged as m1"),
+                          ("c", "merged", "!4 merged as m1")])
 
 
 class ReportFollowups(unittest.TestCase):
@@ -1468,8 +1522,8 @@ class FakeForge:
     def rebase(self, iid):
         self.rebased += 1
 
-    def merge(self, iid, sha):
-        self.merged = sha
+    def merge(self, iid, sha, branch):
+        self.merged, self.branch = sha, branch
         return {"state": "merged", "commit": "c0ffee", "url": "u"}
 
 
@@ -1492,6 +1546,11 @@ class LandLoop(unittest.TestCase):
         forge = FakeForge([mr(detailed_merge_status="need_rebase"), mr(detailed_merge_status="need_rebase"), mr(sha="def", head_pipeline={"status": "success", "sha": "def"})])
         result = self.run_loop(forge)
         self.assertEqual((forge.rebased, forge.merged, result["rebased"]), (1, "def", True))
+
+    def test_merges_with_the_branch_it_read_before_the_merge(self):
+        forge = FakeForge([mr(source_branch="feat/x")])
+        self.run_loop(forge)
+        self.assertEqual(forge.branch, "feat/x")
 
 
 class HeadLanded(unittest.TestCase):
