@@ -6,7 +6,7 @@ The herdr skills run the same flow on every project: spawn a ticket agent in its
 2. **A personal overlay:** the first `~/.config/herdr/profiles/*.json` whose `match` fits the repo (a substring of the `origin` URL, or the main checkout's path). Its fields replace the repo's; a field that is an object in both is merged one level deep (`brief.notes` from the overlay replaces the repo's list). Use it for what belongs to one person, such as their planning page and their copies of the repo's docs, or for a repo without a profile file.
 3. **The defaults** in the table below.
 
-`/herdr:setup` proposes a repo's profile from [examples/minimal](examples/minimal) or [examples/full](examples/full), which also has a sample personal overlay. A repo with neither file still works on the defaults. See what a repo resolves to: `sh "${CLAUDE_PLUGIN_ROOT}/scripts/herdr-tools" profile --path <repo>`. In its output, `defaulted` lists the fields that came from defaults and `sources` names the two files used.
+`/herdr:setup` proposes a repo's profile from [examples/minimal](examples/minimal) or [examples/full](examples/full), which also has a sample personal overlay. A repository that already has its own launcher and merge process can hand those steps over instead: see [examples/repo-process](examples/repo-process). A repo with neither file still works on the defaults. See what a repo resolves to: `sh "${CLAUDE_PLUGIN_ROOT}/scripts/herdr-tools" profile --path <repo>`. In its output, `defaulted` lists the fields that came from defaults and `sources` names the two files used.
 
 | Field | Meaning | Default |
 | - | - | - |
@@ -22,5 +22,10 @@ The herdr skills run the same flow on every project: spawn a ticket agent in its
 | `brief.implement` | How a spawned agent works the ticket | plan first, stop for approval, then test-first |
 | `brief.mr_create` | How it opens the MR | `glab mr create` or `gh pr create` by forge |
 | `brief.notes` | Project facts every brief carries (auth, done criteria, merge rules) | none |
+| `spawn.command` | The repository's own launcher, for a repo that starts work its own way (it creates the worktree and session, and may claim the ticket). `/herdr:spawn` runs it through `herdr_tools.py repo-launch` instead of creating a worktree and calling `launch`. `{key}` is the ticket or task key, `{branch}` the branch when one was settled; each placeholder fills one argument and is never read as shell. A non-zero exit is shown as the launcher said it, never retried or worked around | none: spawn's own flow |
+| `spawn.agent` | Required with `spawn.command`: the name of the agent the launcher starts, with the same placeholders (`session-{key}`). The helper waits for it in `herdr agent list` | none |
+| `spawn.brief` | Whether spawn writes and sends a brief. `false` when the launcher brings its own task context; the agent then keeps no status report, and retire does not ask for one | `true` |
+| `retire.land` | Who merges: `helper` (retire squash-merges through `land`) or `repo` (the repository's own process merges; `land`, `land` with several agents, and `watch` refuse before any forge call, and retire waits for the MR to be merged) | `helper` |
+| `retire.branch_cleanup` | Who deletes the branch: `helper` (retire's `git branch -D`) or `repo` (`worktree.remove` deletes it too, and a refusal from it is reported, never worked around by removing the worktree by hand) | `helper` |
 
 Keep only the fields that differ from the defaults. Never put secrets in a profile: `env` values are shell expressions evaluated at run time.

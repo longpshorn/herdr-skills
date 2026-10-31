@@ -78,13 +78,14 @@ Retire checks that the worktree's HEAD landed. When `land` rebased the MR first,
 
 ## Project profiles
 
-Each project describes itself in a profile: forge, tracker, worktree commands, dev server, and how its agents work and open MRs. The repo keeps it in `.claude/herdr-profile.json`. You can lay your own personal overlay over it in `~/.config/herdr/profiles/`. A repo without either still works on detected defaults. [herdr/PROFILES.md](herdr/PROFILES.md) explains the fields.
+Each project describes itself in a profile: forge, tracker, worktree commands, dev server, and how its agents work and open MRs. A repository that already has its own launcher or merge process can hand those steps to it (`spawn.command`, `retire.land: repo`), so the skills never start or merge work around it; [`herdr/examples/repo-process`](herdr/examples/repo-process) shows how. Without those fields the default flow runs. The repo keeps it in `.claude/herdr-profile.json`. You can lay your own personal overlay over it in `~/.config/herdr/profiles/`. A repo without either still works on detected defaults. [herdr/PROFILES.md](herdr/PROFILES.md) explains the fields.
 
 ## Examples
 
 The plugin works on any repo, but much of what makes parallel agents safe lives in the repo itself. Two examples, which `/herdr:setup` reads from, show it:
 
 - [`herdr/examples/minimal`](herdr/examples/minimal): one profile file for a GitHub repo, and a sample personal overlay. Enough for one person running a few agents.
+- [`herdr/examples/repo-process`](herdr/examples/repo-process): a profile for a repository with its own launcher and merge process. Spawn runs the launcher, and retire waits for the repo's own merge, then cleans up with the repo's command.
 - [`herdr/examples/full`](herdr/examples/full): a small Node sample repo with every practice, each small and tested: a worktree command with per-worktree ports, the agent lifecycle in `CLAUDE.md`, a Stop hook that runs the checks, one owner per shared concept with a check, doc parity and docs-impact, MR and PR templates with "Docs reviewed", and a bootstrap that installs this plugin in each developer's own settings. Its README shows the GitHub variant.
 
 ## Development

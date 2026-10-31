@@ -10,6 +10,10 @@
       Open WORKTREE as a background workspace, start a named agent in it, stop if a folder-trust prompt shows,
       otherwise send the prompt and confirm the agent started working. Prints a JSON summary. Herdr finds or creates
       the repo's parent workspace. At a trust prompt the prompt is saved for send-prompt.
+  herdr_tools.py repo-launch --path REPO --key KEY [--branch BRANCH] [--timeout-seconds 120]
+      Spawn through the repo's own launcher (its profile's spawn.command, with {key} and {branch} filled in) instead
+      of launch, then wait for the agent it starts (spawn.agent). The launcher owns the worktree and the workspace;
+      its refusal is shown as it said it.
   herdr_tools.py send-prompt --name AGENT [--prompt TEXT | --prompt-file FILE] [--timeout-seconds 600]
       Finish a launch that stopped at the folder-trust prompt: wait until the person running the session answers it
       and the agent is idle, then send the prompt launch saved (or the one given) and confirm the agent started working.
@@ -21,7 +25,8 @@
   herdr_tools.py land [AGENT|WORKSPACE_ID|LABEL] [--mr URL|GROUP/PROJECT!IID] [--timeout-minutes 30]
       Merge the agent's validated MR (its worktree branch's, else the one its status report names), or the MR --mr
       names in any repo: rebase if behind, wait for the head pipeline, squash-merge pinned to that commit. Stops on a
-      draft, conflicts, unresolved threads, a failed pipeline or a missing approval.
+      draft, conflicts, unresolved threads, a failed pipeline or a missing approval. Refused outright (as are the
+      forms below and watch) for a repo whose profile sets retire.land to "repo": its own process merges.
   herdr_tools.py land AGENT AGENT... [--max-hours 3] [--timeout-minutes 30]
       Land several agents' MRs in this order. An agent whose MR conflicts is asked once to rebase and retried after
       the others until --max-hours; any other refusal fails that agent. Prints one line per agent; exits 1 unless
@@ -51,6 +56,7 @@ import fnmatch
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -202,12 +208,17 @@ def merged_commit(mr):
     return mr.get("squash_commit_sha") or mr.get("merge_commit_sha")
 
 
-def retire_checks(agent_status, porcelain, mr_state, head_landed, report, worktree_removed=False, approval=None):
+def retire_checks(agent_status, porcelain, mr_state, head_landed, report, worktree_removed=False, approval=None,
+                  land_mode="helper", report_expected=True):
     """Every check /herdr:retire reports, in order. The workspace may be retired only when all are ok.
 
     head_landed: how the worktree's HEAD landed (see head_landed_how), or a falsy value when it did not.
     worktree_removed: the worktree folder is already gone, so nothing local can be lost; the agent's report still gates.
     approval: an open MR's approval state (gitlab_approval's shape); None when there is no open MR to approve.
+    land_mode: the profile's retire.land. With "repo" the repository's own process merges and approves, so an open MR
+    is waited on, never landed, and its approval is not this helper's check.
+    report_expected: false when the agent got no brief (spawn.brief false) and so keeps no status report; a report it
+    wrote anyway still gates.
     """
     fields = report["fields"] if report else {}
     questions = report["sections"].get("Open questions", "") if report else ""
@@ -215,6 +226,8 @@ def retire_checks(agent_status, porcelain, mr_state, head_landed, report, worktr
 
     def check(name, ok, detail):
         return {"check": name, "ok": ok, "detail": detail}
+
+    by_repo = land_mode == "repo"
 
     if worktree_removed:
         local = [
@@ -225,7 +238,9 @@ def retire_checks(agent_status, porcelain, mr_state, head_landed, report, worktr
     else:
         local = [
             check("worktree", not porcelain.strip(), "clean" if not porcelain.strip() else "uncommitted:\n" + porcelain.rstrip()),
-            check("merged", mr_state == "merged", "MR is %s" % (mr_state or "not found")),
+            check("merged", mr_state == "merged",
+                  "MR is opened; the repository's own process merges it (retire.land: repo), so retire waits for that"
+                  if by_repo and mr_state == "opened" else "MR is %s" % (mr_state or "not found")),
             check(
                 "head",
                 bool(head_landed),
@@ -234,11 +249,20 @@ def retire_checks(agent_status, porcelain, mr_state, head_landed, report, worktr
                 "HEAD has commits the merge did not take",
             ),
         ]
-    if approval is None:
+    if by_repo:
+        local.append(check("approved", True, "approval belongs to the repository's own process (retire.land: repo)"))
+    elif approval is None:
         local.append(check("approved", True, "no open MR to approve"))
     else:
         local.append(check("approved", approval["approved"], approval_detail(approval)))
-    return [check("agent", agent_status in ("idle", "done"), "agent is %s" % agent_status)] + local + [
+    agent = [check("agent", agent_status in ("idle", "done"), "agent is %s" % agent_status)]
+    if report is None and not report_expected:
+        return agent + local + [
+            check("report", True, "no status report expected: the agent got no brief (spawn.brief: false)"),
+            check("safe_to_retire", True, "not reported; the worktree, merged and head checks decide"),
+            check("open_questions", True, "none reported"),
+        ]
+    return agent + local + [
         check("report", report is not None, "status report present" if report else "no status report"),
         check(
             "safe_to_retire",
@@ -260,7 +284,11 @@ WAITING_MERGE_STATUS = {"checking", "unchecked", "ci_still_running", "preparing"
 REPO_PROFILE = os.path.join(".claude", "herdr-profile.json")
 OVERLAY_DIR = os.path.expanduser("~/.config/herdr/profiles")
 PROFILE_KEYS = {"name", "match", "forge", "tracker", "worktree", "dev_server", "restart_on", "brief", "planning",
-                "mirrors"}
+                "mirrors", "spawn", "retire"}
+# Who does a step: "helper" is this plugin's own flow (the default); "repo" is the repository's own process.
+STEP_OWNERS = ("helper", "repo")
+SPAWN_KEYS = {"command", "agent", "brief"}
+RETIRE_KEYS = {"land", "branch_cleanup"}
 MIRROR_BACKUPS = os.path.expanduser("~/.cache/herdr/mirror-backups")
 DEFAULT_RESTART_ON = [
     "pnpm-lock.yaml", "package-lock.json", "yarn.lock", "bun.lock", "bun.lockb", "**/package.json",
@@ -312,6 +340,9 @@ def resolve_profile(profile, remote_url):
         "brief": {"implement": "Plan first and stop for the approval of the person running the session, then work "
                                "test-first.",
                   "mr_create": MR_CREATE.get(forge), "notes": []},
+        # A repository with its own launcher or merge process hands those steps to it (see PROFILES.md).
+        "spawn": {"command": None, "agent": None, "brief": True},
+        "retire": {"land": "helper", "branch_cleanup": "helper"},
     }
     resolved = {"defaulted": [k for k in defaults if k not in profile]}
     for key, default in defaults.items():
@@ -319,7 +350,46 @@ def resolve_profile(profile, remote_url):
         if isinstance(default, dict) and isinstance(value, dict):
             value = dict(default, **value)
         resolved[key] = value
+    check_process_fields(profile, resolved)
     return resolved
+
+
+def check_process_fields(profile, resolved):
+    """Refuse a spawn or retire field the helper would misread: a typo there could quietly fall back to the default
+    flow, and the default retire merges."""
+    name = profile.get("name")
+    for field, keys in (("spawn", SPAWN_KEYS), ("retire", RETIRE_KEYS)):
+        if not isinstance(resolved[field], dict):
+            raise HerdrError("Profile %r: %s must be an object." % (name, field))
+        unknown = set(resolved[field]) - keys
+        if unknown:
+            raise HerdrError("Profile %r has unknown %s keys: %s" % (name, field, ", ".join(sorted(unknown))))
+    for key in sorted(RETIRE_KEYS):
+        if resolved["retire"][key] not in STEP_OWNERS:
+            raise HerdrError("Profile %r: retire.%s must be %s, not %r." % (
+                name, key, " or ".join('"%s"' % o for o in STEP_OWNERS), resolved["retire"][key]))
+    spawn = resolved["spawn"]
+    if not isinstance(spawn["brief"], bool):
+        raise HerdrError("Profile %r: spawn.brief must be true or false." % name)
+    if spawn["command"] and not spawn["agent"]:
+        raise HerdrError("Profile %r: spawn.command needs spawn.agent, the name of the agent it starts (it may use "
+                         "the same {placeholders})." % name)
+    if spawn["agent"] and not spawn["command"]:
+        raise HerdrError("Profile %r: spawn.agent only names the agent spawn.command starts; set spawn.command too."
+                         % name)
+
+
+PLACEHOLDER = re.compile(r"\{(\w+)\}")
+
+
+def fill_command(template, values):
+    """The argv for a profile command: split like a shell would, then each {placeholder} filled inside its own
+    argument. A value is never split or read as shell, so a ticket title can't become a second command."""
+    def fill(match):
+        if values.get(match.group(1)) is None:
+            raise HerdrError("%r needs a value for {%s}." % (template, match.group(1)))
+        return str(values[match.group(1)])
+    return [PLACEHOLDER.sub(fill, token) for token in shlex.split(template)]
 
 
 def read_json(path):
@@ -989,7 +1059,8 @@ def retire_info(target):
     looks_like_branch = bool(branch) and " " not in branch
     mr, forge = resolve_mr(forge_for(profile), branch if looks_like_branch else None, report, main_checkout)
     viewed = forge.view(mr["iid"])[0] if mr and mr["state"] in ("opened", "merged") else {}
-    approval = viewed["approvals"] if mr and mr["state"] == "opened" else None
+    by_repo = profile["retire"]["land"] == "repo"
+    approval = viewed["approvals"] if mr and mr["state"] == "opened" and not by_repo else None
     if not removed:
         default = git(main_checkout, "symbolic-ref", "--short", "refs/remotes/origin/HEAD")[1] or "origin/main"
         on_default = git(path, "merge-base", "--is-ancestor", "HEAD", default)[0] == 0
@@ -1016,9 +1087,13 @@ def retire_info(target):
         "report_path": report_path,
         "report": report,
         "followups": report_followups(report),
+        "land": profile["retire"]["land"],
+        "branch_cleanup": profile["retire"]["branch_cleanup"],
+        "worktree_remove": profile["worktree"].get("remove"),
         "checks": retire_checks(
             agent.get("agent_status", "unknown") if agent else "gone",
             porcelain, mr["state"] if mr else None, head_landed, report, worktree_removed=removed, approval=approval,
+            land_mode=profile["retire"]["land"], report_expected=profile["spawn"]["brief"],
         ),
     }
 
@@ -1059,15 +1134,47 @@ def land_loop(forge, iid, timeout_seconds, poll_seconds=20, sleep=time.sleep, ma
         sleep(poll_seconds)
 
 
+def agent_profile(target):
+    """The resolved profile of the repo an agent's worktree belongs to (the agent named as retire-info takes it)."""
+    agents = herdr("agent", "list")["result"]["agents"]
+    ws = find_retire_target(workspaces(), agents, target, os.environ.get("HERDR_WORKSPACE_ID"))
+    path = ws["worktree"]["checkout_path"]
+    return project_profile(repo_root(path) if os.path.isdir(path) else ws["worktree"]["repo_root"])
+
+
+def cwd_profile():
+    """The resolved profile of the repo the helper runs in, or None outside a git repository."""
+    try:
+        return project_profile(repo_root(os.getcwd()))
+    except HerdrError:
+        return None
+
+
+def refuse_repo_land(profile, what):
+    """Refuse to merge for a repo whose profile hands merging to its own process (retire.land: repo). Checked before any
+    forge call, so no rebase, merge or branch delete can happen on that repo's MRs from here."""
+    if profile and profile["retire"]["land"] == "repo":
+        source = (profile.get("sources") or {}).get("overlay") or (profile.get("sources") or {}).get("repo")
+        raise HerdrError(
+            "Not landing %s: %s merges through its own process (retire.land: repo%s), so this helper never merges, "
+            "rebases or deletes branches there. Land it the repository's way, then run /herdr:retire to clean up."
+            % (what, profile.get("main_checkout") or "this repo", ", in %s" % source if source else ""))
+
+
 def land(target, timeout_minutes=30, poll_seconds=20, mr=None):
     """Merge a validated MR or PR: rebase when it is behind, wait for the head pipeline, then squash-merge pinned to that
     commit. The MR is the agent's (its worktree branch's, else the one its status report names) or the one `mr` names
-    by URL or `group/project!iid`, which may live in any repo."""
+    by URL or `group/project!iid`, which may live in any repo.
+
+    Refused for a repo whose profile sets retire.land to "repo": the agent's repo, or for --mr the repo the helper runs
+    in. (An MR named by URL from outside that repo can't be traced to a profile, so run --mr from its checkout.)"""
     if mr is not None:
+        refuse_repo_land(cwd_profile(), mr)
         ref = parse_mr_ref(mr)
         return land_loop(forge_for_ref(ref, os.getcwd()), ref["iid"], timeout_minutes * 60, poll_seconds)
     if not target:
         raise HerdrError("Name the agent whose MR to land, or the MR itself with --mr <url or group/project!iid>.")
+    refuse_repo_land(agent_profile(target), "%s's MR" % target)
     info = retire_info(target)
     if not info["mr"]:
         raise HerdrError("No merge request found for %s, and the agent's status report names none; pass it with "
@@ -1104,7 +1211,14 @@ def watch_loop(agents, land_fn, ask_fn, report_fn, max_seconds, poll_seconds=120
     raise HerdrError("Nothing landed in %.1f hours." % (max_seconds / 3600.0))
 
 
+def refuse_repo_land_all(agents):
+    """Refuse a batch before landing any of it when one agent's repo merges through its own process."""
+    for agent in agents:
+        refuse_repo_land(agent_profile(agent), "%s's MR" % agent)
+
+
 def watch(agents, max_hours=4.0, poll_seconds=120):
+    refuse_repo_land_all(agents)
     return watch_loop(
         agents, land, lambda agent, message: herdr("agent", "prompt", agent, message, parse=False),
         lambda agent: read_report(agent)[1], max_hours * 3600, poll_seconds)
@@ -1148,6 +1262,7 @@ def format_land_results(results):
 
 
 def land_several(agents, timeout_minutes=30, max_hours=3.0, poll_seconds=300):
+    refuse_repo_land_all(agents)
     return land_queue(
         agents, lambda agent: land(agent, timeout_minutes),
         lambda agent, message: herdr("agent", "prompt", agent, message, parse=False), max_hours * 3600, poll_seconds)
@@ -1353,6 +1468,43 @@ def launch(path, label, name, kind, prompt, sleep=time.sleep, busy_timeout_secon
     return summary
 
 
+REPO_LAUNCH_TIMEOUT = 120
+
+
+def repo_launch(main_checkout, profile, values, runner=subprocess.run, sleep=time.sleep,
+                timeout_seconds=REPO_LAUNCH_TIMEOUT, poll_seconds=2):
+    """Spawn through the repository's own launcher (spawn.command) instead of `launch`: run it from the main checkout
+    with VALUES filled in ({key}, {branch}, ...), then wait for the agent it names (spawn.agent) to appear. The launcher
+    owns the worktree, the workspace and starting the agent; this never creates or starts either. A refusal (non-zero
+    exit) is raised as the launcher said it, and nothing is retried."""
+    spawn = profile["spawn"]
+    if not spawn["command"]:
+        raise HerdrError("This repo's profile has no spawn.command; use `launch` (the default spawn flow).")
+    argv = fill_command(spawn["command"], values)
+    name = PLACEHOLDER.sub(lambda m: str(values.get(m.group(1), m.group(0))), spawn["agent"])
+    if not re.match(r"^[a-z][a-z0-9_-]{0,31}$", name):
+        raise HerdrError("spawn.agent resolved to %r, which is not a Herdr agent name." % name)
+    proc = runner(argv, capture_output=True, text=True, cwd=main_checkout)
+    output = "\n".join(part.strip() for part in (proc.stdout, proc.stderr) if part and part.strip())
+    if proc.returncode != 0:
+        raise HerdrError("The repo's launcher refused (exit %d): %s\n%s" % (proc.returncode, " ".join(argv),
+                                                                          output or "(no output)"))
+    waited = 0.0
+    while True:
+        agent = next((a for a in herdr("agent", "list")["result"]["agents"] if a.get("name") == name), None)
+        if agent:
+            break
+        if waited >= timeout_seconds:
+            raise HerdrError("Ran %s, but no agent named %s appeared within %gs. Check the workspace it opened."
+                             % (" ".join(argv), name, timeout_seconds))
+        sleep(poll_seconds)
+        waited += poll_seconds
+    screen = herdr("agent", "read", name, "--source", "visible", "--lines", "60", parse=False)
+    return {"agent": name, "workspace_id": agent.get("workspace_id"), "pane_id": agent.get("pane_id"),
+            "status": agent.get("agent_status"), "command": argv, "output": output[-2000:],
+            "brief": spawn["brief"], "trust_prompt": has_trust_prompt(screen)}
+
+
 # ---- CLI -----------------------------------------------------------------------------------------------------------
 
 
@@ -1372,6 +1524,11 @@ def main(argv=None):
     group = ln.add_mutually_exclusive_group(required=True)
     group.add_argument("--prompt")
     group.add_argument("--prompt-file")
+    rl = sub.add_parser("repo-launch")
+    rl.add_argument("--path", required=True)
+    rl.add_argument("--key", required=True)
+    rl.add_argument("--branch")
+    rl.add_argument("--timeout-seconds", type=float, default=REPO_LAUNCH_TIMEOUT)
     sp = sub.add_parser("send-prompt")
     sp.add_argument("--name", required=True)
     sp.add_argument("--timeout-seconds", type=float, default=600)
@@ -1426,6 +1583,10 @@ def main(argv=None):
         elif args.command == "launch":
             prompt = args.prompt if args.prompt is not None else open(args.prompt_file).read().strip()
             print(json.dumps(launch(args.path, args.label, args.name, args.kind, prompt), indent=2))
+        elif args.command == "repo-launch":
+            main = repo_root(args.path)
+            print(json.dumps(repo_launch(main, project_profile(main), {"key": args.key, "branch": args.branch},
+                                         timeout_seconds=args.timeout_seconds), indent=2))
         elif args.command == "send-prompt":
             prompt = open(args.prompt_file).read().strip() if args.prompt_file else args.prompt
             print(json.dumps(send_prompt(args.name, prompt, args.timeout_seconds), indent=2))

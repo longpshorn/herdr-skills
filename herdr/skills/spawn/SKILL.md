@@ -17,6 +17,23 @@ Helper: `sh "${CLAUDE_PLUGIN_ROOT}/scripts/herdr-tools"`, written `herdr_tools.p
 - **Kind:** `claude` unless the user asks for another.
 - **Shared concepts, across a batch:** list the concepts each ticket will define or change (rules, thresholds, mappings, value sets, vocabularies other code must agree with) and find their current owners in the code. Agents in parallel worktrees can't see each other, so a concept touched by two tickets gets one owner ticket. The others reuse its definition, landing after it or rebasing onto it. Say which in each brief.
 
+## When the repo has its own launcher
+
+If the profile sets `spawn.command`, the repository starts work its own way: its launcher creates the worktree, opens the workspace, starts the agent and may claim the ticket itself. Skip steps 2–4 and run:
+
+```bash
+herdr_tools.py repo-launch --path <repo> --key <KEY> [--branch <branch>]
+```
+
+Pass `--branch` only when the launcher's command uses `{branch}`. It runs the launcher from the main checkout and waits for the agent named by `spawn.agent`. Read its JSON:
+
+- A refusal is printed as the launcher said it, for example a ticket that is already claimed or a workspace that is already open. Show it to the user and stop. Never work around it with `launch`, `git worktree add` or `herdr agent start`.
+- `trust_prompt: true`: the agent is at Claude's folder-trust prompt. Tell the user which workspace to open, and never answer it for them.
+- `brief: true` (the profile's `spawn.brief`): write the brief as in step 3, then send it with `herdr_tools.py send-prompt --name <agent> --prompt "Read the brief at <brief path> …"` once the agent is idle.
+- `brief: false`: send nothing. The launcher gave the agent its task.
+
+Then report as in step 5: the workspace, the agent and the launcher's output. The names and branch come from the launcher, not from step 1.
+
 ## 2. Create the worktree
 
 Use the profile's `worktree.new` with `{branch}` filled in and its `worktree.env` exported first (values are shell expressions such as a CLI's token; never print a token). With no `worktree.new`, run `git worktree add -b <branch> ../<repo>-<KEY-or-topic>-<slug> origin/<default branch>` from the repo, then the repo's own setup command (look in its `CLAUDE.md`, README, `package.json` scripts or `Makefile`). Confirm the branch is checked out there before going on.
