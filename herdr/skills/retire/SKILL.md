@@ -1,6 +1,6 @@
 ---
 name: retire
-description: Finish a ticket agent's work — land its validated MR if it is still open (squash-merge from here), close its Herdr workspace and remove its git worktree, close the ticket, fast-forward the main checkout and restart main's dev server, log the outcome to the matching /work: workstream, and capture every valid follow-up as a prioritized ticket on the planning page, after checks and one confirmation from the user. Use for "/herdr:retire <agent or workspace>", "land RES-1117", "clean up the RES-1102 worktree", "close the finished sessions".
+description: Finish a ticket agent's work — land its validated MR if it is still open (squash-merge from here), close its Herdr workspace and remove its git worktree, close the ticket, fast-forward the main checkout and restart main's dev server, log the outcome to the matching /work: workstream, and capture every valid follow-up as a prioritized ticket on the planning page, after checks and one confirmation from the user. Use for "/herdr:retire <agent or workspace>", "land PROJ-117", "clean up the PROJ-102 worktree", "close the finished sessions".
 ---
 
 # Retire — land, close the workspace and worktree, update main, log the outcome

@@ -35,7 +35,7 @@ The plugin has no pinned version, so every commit here is a new version. Run `cl
 
 ## The workflow
 
-1. **Spawn.** `/herdr:spawn RES-123` reads the ticket, creates a worktree and branch (with the project's own worktree command when it has one), writes a brief, opens a background workspace and starts a named agent with the brief.
+1. **Spawn.** `/herdr:spawn PROJ-123` reads the ticket, creates a worktree and branch (with the project's own worktree command when it has one), writes a brief, opens a background workspace and starts a named agent with the brief.
 2. **Trust prompt.** A new worktree is a folder Claude Code hasn't seen, so the agent may stop at the folder-trust prompt. Answer it yourself in that workspace; the skills never answer it for you. The brief is then sent automatically.
 3. **Plan gate.** The agent reads the brief, plans, and stops. `/herdr:status` shows it as `blocked`; `/herdr:peek <agent>` shows the plan. Approve it, or change it, with `/herdr:ask <agent> "<your answer>"` or by typing in its pane.
 4. **Build.** The agent works test-first, commits, pushes, opens the MR and waits for the pipeline. It never merges.

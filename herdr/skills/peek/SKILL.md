@@ -1,6 +1,6 @@
 ---
 name: peek
-description: Read what a Herdr agent is doing or waiting for, without sending it anything. Use for "/herdr:peek <agent>", "what is res1105 up to", "why is the ui agent blocked", "show me the agent's last answer". Read-only.
+description: Read what a Herdr agent is doing or waiting for, without sending it anything. Use for "/herdr:peek <agent>", "what is proj105 up to", "why is the ui agent blocked", "show me the agent's last answer". Read-only.
 ---
 
 # Peek — read an agent without disturbing it
