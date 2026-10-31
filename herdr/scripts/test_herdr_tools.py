@@ -1901,6 +1901,7 @@ class CwdProfileFailsClosed(unittest.TestCase):
     def test_outside_any_git_repo_there_is_no_profile(self):
         outside = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, outside)
+        self.addCleanup(os.chdir, os.getcwd())  # runs first: Windows can't remove the folder it is standing in
         os.chdir(outside)
         self.assertIsNone(ht.cwd_profile())
 
