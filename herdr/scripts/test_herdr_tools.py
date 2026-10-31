@@ -1962,3 +1962,51 @@ class RepoLaunchRobustness(AgentHerdrTest):
             raise subprocess.TimeoutExpired(argv, kwargs.get("timeout"))
         with self.assertRaisesRegex(ht.HerdrError, "did not finish"):
             self.launch(runner=hang)
+
+
+class WorkToolsPath(unittest.TestCase):
+    """retire-info names the installed work plugin's launcher, so retire reaches it from herdr's own plugin."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.plugins = os.path.join(self.tmp, "plugins")
+        os.makedirs(self.plugins)
+
+    def write_json(self, path, data):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(data, handle)
+
+    def touch(self, path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        open(path, "w").close()
+
+    def install(self, marketplace_source, install_path):
+        self.write_json(os.path.join(self.plugins, "installed_plugins.json"),
+                        {"version": 2, "plugins": {"work@work-skills": [{"scope": "user", "installPath": install_path}]}})
+        self.write_json(os.path.join(self.plugins, "known_marketplaces.json"),
+                        {"work-skills": {"source": marketplace_source}})
+
+    def test_work_tools_from_a_directory_marketplace(self):
+        clone = os.path.join(self.tmp, "work-skills")
+        self.write_json(os.path.join(clone, ".claude-plugin", "marketplace.json"),
+                        {"name": "work-skills", "plugins": [{"name": "work", "source": "./work"}]})
+        self.touch(os.path.join(clone, "work", "scripts", "work-tools"))
+        self.install({"source": "directory", "path": clone}, os.path.join(self.tmp, "cache", "work"))
+        self.assertEqual(ht.work_tools_path(self.plugins), os.path.join(clone, "work", "scripts", "work-tools"))
+
+    def test_work_tools_from_an_installed_copy(self):
+        cache = os.path.join(self.tmp, "cache", "work-skills", "work", "abc123")
+        self.touch(os.path.join(cache, "scripts", "work-tools"))
+        self.install({"source": "github", "repo": "longpshorn/work-skills"}, cache)
+        self.assertEqual(ht.work_tools_path(self.plugins), os.path.join(cache, "scripts", "work-tools"))
+
+    def test_work_tools_none_when_not_installed(self):
+        self.write_json(os.path.join(self.plugins, "installed_plugins.json"), {"version": 2, "plugins": {}})
+        self.assertIsNone(ht.work_tools_path(self.plugins))
+        self.assertIsNone(ht.work_tools_path(os.path.join(self.tmp, "nowhere")))
+
+    def test_work_tools_none_when_file_missing(self):
+        self.install({"source": "github", "repo": "longpshorn/work-skills"}, os.path.join(self.tmp, "cache", "gone"))
+        self.assertIsNone(ht.work_tools_path(self.plugins))

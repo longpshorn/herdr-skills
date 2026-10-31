@@ -1047,6 +1047,36 @@ def read_report(agent):
         return path, parse_status_report(handle.read())
 
 
+def read_json_or_none(path):
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return None
+
+
+def work_tools_path(plugins_dir=None):
+    """The installed `work` plugin's launcher (scripts/work-tools), or None. A directory marketplace is read in place,
+    so its plugin folder wins over the install cache."""
+    plugins_dir = plugins_dir or os.path.expanduser("~/.claude/plugins")
+    installed = (read_json_or_none(os.path.join(plugins_dir, "installed_plugins.json")) or {}).get("plugins", {})
+    key = next((k for k in installed if k.split("@")[0] == "work"), None)
+    if not key or not installed[key]:
+        return None
+    marketplace = key.split("@", 1)[1] if "@" in key else ""
+    source = ((read_json_or_none(os.path.join(plugins_dir, "known_marketplaces.json")) or {})
+              .get(marketplace, {}).get("source", {}))
+    roots = []
+    if source.get("source") == "directory" and source.get("path"):
+        catalog = read_json_or_none(os.path.join(source["path"], ".claude-plugin", "marketplace.json")) or {}
+        entry = next((p for p in catalog.get("plugins", []) if p.get("name") == "work"), None)
+        if entry and isinstance(entry.get("source"), str):
+            roots.append(os.path.normpath(os.path.join(source["path"], entry["source"])))
+    roots.append(installed[key][0].get("installPath") or "")
+    return next((os.path.join(r, "scripts", "work-tools") for r in roots
+                 if r and os.path.isfile(os.path.join(r, "scripts", "work-tools"))), None)
+
+
 def retire_info(target):
     """Everything /herdr:retire needs to decide, as one JSON-ready dict."""
     agents = herdr("agent", "list")["result"]["agents"]
@@ -1102,6 +1132,7 @@ def retire_info(target):
         "land": profile["retire"]["land"],
         "branch_cleanup": profile["retire"]["branch_cleanup"],
         "worktree_remove": profile["worktree"].get("remove"),
+        "work_tools": work_tools_path(),
         "checks": retire_checks(
             agent.get("agent_status", "unknown") if agent else "gone",
             porcelain, mr["state"] if mr else None, head_landed, report, worktree_removed=removed, approval=approval,
