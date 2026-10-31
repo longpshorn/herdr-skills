@@ -2010,3 +2010,34 @@ class WorkToolsPath(unittest.TestCase):
     def test_work_tools_none_when_file_missing(self):
         self.install({"source": "github", "repo": "longpshorn/work-skills"}, os.path.join(self.tmp, "cache", "gone"))
         self.assertIsNone(ht.work_tools_path(self.plugins))
+
+    def test_work_tools_skips_a_work_plugin_without_a_launcher(self):
+        cache = os.path.join(self.tmp, "cache", "work-skills", "work", "abc123")
+        self.touch(os.path.join(cache, "scripts", "work-tools"))
+        self.write_json(os.path.join(self.plugins, "installed_plugins.json"), {"version": 2, "plugins": {
+            "work@work-store": [{"scope": "user", "installPath": os.path.join(self.tmp, "old")}],
+            "work@work-skills": [{"scope": "user", "installPath": cache}]}})
+        self.write_json(os.path.join(self.plugins, "known_marketplaces.json"),
+                        {"work-skills": {"source": {"source": "github", "repo": "longpshorn/work-skills"}}})
+        self.assertEqual(ht.work_tools_path(self.plugins), os.path.join(cache, "scripts", "work-tools"))
+
+    def test_work_tools_skips_a_disabled_work_plugin(self):
+        cache = os.path.join(self.tmp, "cache", "work")
+        self.touch(os.path.join(cache, "scripts", "work-tools"))
+        self.install({"source": "github", "repo": "longpshorn/work-skills"}, cache)
+        self.write_json(os.path.join(self.tmp, "settings.json"), {"enabledPlugins": {"work@work-skills": False}})
+        self.assertIsNone(ht.work_tools_path(self.plugins))
+
+    def test_work_tools_none_on_unexpected_file_shapes(self):
+        shapes = [
+            ({"version": 1, "plugins": {"work@work-skills": {"installPath": "/x"}}}, {}),
+            ({"plugins": {"work@work-skills": [{"installPath": "/x"}]}}, {"work-skills": "not an object"}),
+            ({"plugins": {"work@work-skills": [{"installPath": "/x"}]}}, {"work-skills": {"source": ["list"]}}),
+            ({"plugins": ["not", "a", "dict"]}, {}),
+            ([1, 2], []),
+        ]
+        for installed, known in shapes:
+            self.write_json(os.path.join(self.plugins, "installed_plugins.json"), installed)
+            self.write_json(os.path.join(self.plugins, "known_marketplaces.json"), known)
+            self.assertIsNone(ht.work_tools_path(self.plugins), (installed, known))
+

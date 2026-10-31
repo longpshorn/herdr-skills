@@ -1056,25 +1056,34 @@ def read_json_or_none(path):
 
 
 def work_tools_path(plugins_dir=None):
-    """The installed `work` plugin's launcher (scripts/work-tools), or None. A directory marketplace is read in place,
-    so its plugin folder wins over the install cache."""
+    """The launcher (scripts/work-tools) of the first installed, enabled `work` plugin that has one, or None.
+    A directory marketplace is read in place, so its plugin folder wins over the install cache."""
     plugins_dir = plugins_dir or os.path.expanduser("~/.claude/plugins")
-    installed = (read_json_or_none(os.path.join(plugins_dir, "installed_plugins.json")) or {}).get("plugins", {})
-    key = next((k for k in installed if k.split("@")[0] == "work"), None)
-    if not key or not installed[key]:
-        return None
-    marketplace = key.split("@", 1)[1] if "@" in key else ""
-    source = ((read_json_or_none(os.path.join(plugins_dir, "known_marketplaces.json")) or {})
-              .get(marketplace, {}).get("source", {}))
-    roots = []
-    if source.get("source") == "directory" and source.get("path"):
-        catalog = read_json_or_none(os.path.join(source["path"], ".claude-plugin", "marketplace.json")) or {}
-        entry = next((p for p in catalog.get("plugins", []) if p.get("name") == "work"), None)
-        if entry and isinstance(entry.get("source"), str):
-            roots.append(os.path.normpath(os.path.join(source["path"], entry["source"])))
-    roots.append(installed[key][0].get("installPath") or "")
-    return next((os.path.join(r, "scripts", "work-tools") for r in roots
-                 if r and os.path.isfile(os.path.join(r, "scripts", "work-tools"))), None)
+
+    def mapping(value):
+        return value if isinstance(value, dict) else {}
+
+    installed = mapping(mapping(read_json_or_none(os.path.join(plugins_dir, "installed_plugins.json"))).get("plugins"))
+    known = mapping(read_json_or_none(os.path.join(plugins_dir, "known_marketplaces.json")))
+    enabled = mapping(mapping(read_json_or_none(os.path.join(os.path.dirname(plugins_dir), "settings.json")))
+                      .get("enabledPlugins"))
+    for key, entries in installed.items():
+        if key.split("@")[0] != "work" or enabled.get(key) is False or not isinstance(entries, list):
+            continue
+        source = mapping(mapping(known.get(key.split("@", 1)[-1])).get("source"))
+        roots = []
+        if source.get("source") == "directory" and isinstance(source.get("path"), str):
+            catalog = mapping(read_json_or_none(os.path.join(source["path"], ".claude-plugin", "marketplace.json")))
+            plugins = catalog.get("plugins") if isinstance(catalog.get("plugins"), list) else []
+            entry = next((p for p in plugins if isinstance(p, dict) and p.get("name") == "work"), {})
+            if isinstance(entry.get("source"), str):
+                roots.append(os.path.normpath(os.path.join(source["path"], entry["source"])))
+        roots += [e.get("installPath") for e in entries if isinstance(e, dict) and isinstance(e.get("installPath"), str)]
+        for root in roots:
+            launcher = os.path.join(root, "scripts", "work-tools")
+            if os.path.isfile(launcher):
+                return launcher
+    return None
 
 
 def retire_info(target):
