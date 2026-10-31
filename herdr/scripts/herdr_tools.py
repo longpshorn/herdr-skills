@@ -426,8 +426,12 @@ def load_profile(main_checkout, remote_url, overlay_dir=OVERLAY_DIR):
                 repo_retire = (profile or {}).get("retire") or {}
                 profile = merge_profiles(profile or {}, read_json(path))
                 sources["overlay"] = path
+                merged_retire = profile.get("retire") or {}
+                for retire, where in ((repo_retire, repo_path), (merged_retire, path)):
+                    if not isinstance(retire, dict):
+                        raise HerdrError("%s: retire must be an object, not %r." % (where, retire))
                 loosened = [k for k in sorted(RETIRE_KEYS) if repo_retire.get(k) == "repo"
-                            and ((profile.get("retire") or {}).get(k) or "helper") != "repo"]
+                            and (merged_retire.get(k) or "helper") != "repo"]
                 if loosened:
                     raise HerdrError(
                         "The overlay %s sets retire.%s back to the helper, but the repo's profile %s hands it to the "

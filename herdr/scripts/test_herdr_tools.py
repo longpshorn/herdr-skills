@@ -1924,6 +1924,11 @@ class OverlayCannotLoosenTheRepo(unittest.TestCase):
             with self.assertRaisesRegex(ht.HerdrError, "overlay"):
                 ht.load_profile(self.main, "", self.overlays)
 
+    def test_a_retire_that_is_not_an_object_is_a_clean_refusal(self):
+        self.overlay({"retire": "helper"})
+        with self.assertRaisesRegex(ht.HerdrError, "retire must be an object"):
+            ht.load_profile(self.main, "", self.overlays)
+
     def test_an_overlay_may_still_add_personal_fields(self):
         self.overlay({"worktree": {"remove": "./finish --lane mine {branch}"}})
         profile, _ = ht.load_profile(self.main, "", self.overlays)
