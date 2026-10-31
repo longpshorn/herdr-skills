@@ -1,6 +1,6 @@
 ---
 name: spawn
-description: Start a new Herdr agent that works one ticket or task end to end in its own git worktree and workspace, from a written brief, on any project (its specifics come from a herdr profile). Use for "/herdr:spawn <ticket or task>", "start a session for RES-123", "hand this to a new agent", "spin up a worktree agent".
+description: Start a new Herdr agent that works one ticket or task end to end in its own git worktree and workspace, from a written brief, on any project (its specifics come from a herdr profile). Use for "/herdr:spawn <ticket or task>", "start a session for PROJ-123", "hand this to a new agent", "spin up a worktree agent".
 ---
 
 # Spawn — one ticket, one worktree, one agent
@@ -13,7 +13,7 @@ Helper: `sh "${CLAUDE_PLUGIN_ROOT}/scripts/herdr-tools"`, written `herdr_tools.p
 - **Ticket and branch:**
   - `tracker.kind == jira`: read the ticket (`acli jira workitem view KEY`).
   - Branch: with `tracker.branch_command`, run it with `{type}` and `{key}` filled in and the ticket title on stdin, and read `.branch` from its JSON. Otherwise a short `<type>/<KEY-or-topic>-<desc>` branch (conventional-commit type, hyphen-case).
-- **Names:** workspace label `<KEY or topic> <two-word topic>` (e.g. `RES-1105 language`); agent name the key lower-cased without the dash (`res1105`), or a short topic, matching `[a-z][a-z0-9_-]{0,31}`. Check `herdr_tools.py status` so the name is not already taken.
+- **Names:** workspace label `<KEY or topic> <two-word topic>` (e.g. `PROJ-105 language`); agent name the key lower-cased without the dash (`proj105`), or a short topic, matching `[a-z][a-z0-9_-]{0,31}`. Check `herdr_tools.py status` so the name is not already taken.
 - **Kind:** `claude` unless the user asks for another.
 - **Shared concepts, across a batch:** list the concepts each ticket will define or change (rules, thresholds, mappings, value sets, vocabularies other code must agree with) and find their current owners in the code. Agents in parallel worktrees can't see each other, so a concept touched by two tickets gets one owner ticket. The others reuse its definition, landing after it or rebasing onto it. Say which in each brief.
 

@@ -1,6 +1,6 @@
 ---
 name: ask
-description: Send a message to a running Herdr agent by name and, optionally, wait for and read its reply. Use for "/herdr:ask <agent> <message>", "tell res1105 to ...", "ask the ui agent whether ...", "send the prompt to the new agent".
+description: Send a message to a running Herdr agent by name and, optionally, wait for and read its reply. Use for "/herdr:ask <agent> <message>", "tell proj105 to ...", "ask the ui agent whether ...", "send the prompt to the new agent".
 ---
 
 # Ask — talk to another agent
