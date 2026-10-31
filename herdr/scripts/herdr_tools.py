@@ -1047,6 +1047,45 @@ def read_report(agent):
         return path, parse_status_report(handle.read())
 
 
+def read_json_or_none(path):
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return None
+
+
+def work_tools_path(plugins_dir=None):
+    """The launcher (scripts/work-tools) of the first installed, enabled `work` plugin that has one, or None.
+    A directory marketplace is read in place, so its plugin folder wins over the install cache."""
+    plugins_dir = plugins_dir or os.path.expanduser("~/.claude/plugins")
+
+    def mapping(value):
+        return value if isinstance(value, dict) else {}
+
+    installed = mapping(mapping(read_json_or_none(os.path.join(plugins_dir, "installed_plugins.json"))).get("plugins"))
+    known = mapping(read_json_or_none(os.path.join(plugins_dir, "known_marketplaces.json")))
+    enabled = mapping(mapping(read_json_or_none(os.path.join(os.path.dirname(plugins_dir), "settings.json")))
+                      .get("enabledPlugins"))
+    for key, entries in installed.items():
+        if key.split("@")[0] != "work" or enabled.get(key) is False or not isinstance(entries, list):
+            continue
+        source = mapping(mapping(known.get(key.split("@", 1)[-1])).get("source"))
+        roots = []
+        if source.get("source") == "directory" and isinstance(source.get("path"), str):
+            catalog = mapping(read_json_or_none(os.path.join(source["path"], ".claude-plugin", "marketplace.json")))
+            plugins = catalog.get("plugins") if isinstance(catalog.get("plugins"), list) else []
+            entry = next((p for p in plugins if isinstance(p, dict) and p.get("name") == "work"), {})
+            if isinstance(entry.get("source"), str):
+                roots.append(os.path.normpath(os.path.join(source["path"], entry["source"])))
+        roots += [e.get("installPath") for e in entries if isinstance(e, dict) and isinstance(e.get("installPath"), str)]
+        for root in roots:
+            launcher = os.path.join(root, "scripts", "work-tools")
+            if os.path.isfile(launcher):
+                return launcher
+    return None
+
+
 def retire_info(target):
     """Everything /herdr:retire needs to decide, as one JSON-ready dict."""
     agents = herdr("agent", "list")["result"]["agents"]
@@ -1102,6 +1141,7 @@ def retire_info(target):
         "land": profile["retire"]["land"],
         "branch_cleanup": profile["retire"]["branch_cleanup"],
         "worktree_remove": profile["worktree"].get("remove"),
+        "work_tools": work_tools_path(),
         "checks": retire_checks(
             agent.get("agent_status", "unknown") if agent else "gone",
             porcelain, mr["state"] if mr else None, head_landed, report, worktree_removed=removed, approval=approval,
