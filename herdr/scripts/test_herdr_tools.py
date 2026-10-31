@@ -1646,3 +1646,319 @@ class PatchIds(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---- a repository that runs its own entry and merge process ------------------------------------------------------
+
+REPO_PROCESS = {
+    "name": "acme-platform",
+    "forge": "github",
+    "spawn": {"command": "./scripts/start-session {key} --no-focus", "agent": "session-{key}", "brief": False},
+    "retire": {"land": "repo", "branch_cleanup": "repo"},
+    "worktree": {"remove": "./scripts/finish-branch --branch {branch}"},
+}
+
+
+class RepoProcessProfile(unittest.TestCase):
+    def test_without_the_new_fields_the_helper_runs_the_default_flow(self):
+        resolved = ht.resolve_profile(None, "git@github.com:acme/acme-app.git")
+        self.assertEqual(resolved["spawn"], {"command": None, "agent": None, "brief": True})
+        self.assertEqual(resolved["retire"], {"land": "helper", "branch_cleanup": "helper"})
+        self.assertIn("spawn", resolved["defaulted"])
+        self.assertIn("retire", resolved["defaulted"])
+
+    def test_a_repo_can_hand_spawn_and_landing_to_its_own_process(self):
+        resolved = ht.resolve_profile(REPO_PROCESS, "")
+        self.assertEqual(resolved["spawn"]["command"], "./scripts/start-session {key} --no-focus")
+        self.assertFalse(resolved["spawn"]["brief"])
+        self.assertEqual(resolved["retire"], {"land": "repo", "branch_cleanup": "repo"})
+
+    def test_a_partial_retire_field_keeps_the_other_default(self):
+        resolved = ht.resolve_profile({"retire": {"land": "repo"}}, "")
+        self.assertEqual(resolved["retire"], {"land": "repo", "branch_cleanup": "helper"})
+
+    def test_refuses_an_unknown_mode_or_subkey_by_name(self):
+        for bad, needle in (({"retire": {"land": "manual"}}, "retire.land"),
+                            ({"retire": {"branch_cleanup": "never"}}, "retire.branch_cleanup"),
+                            ({"retire": {"lands": "repo"}}, "lands"),
+                            ({"spawn": {"comand": "x"}}, "comand"),
+                            ({"spawn": {"command": "x", "agent": "a", "brief": "no"}}, "spawn.brief")):
+            with self.assertRaisesRegex(ht.HerdrError, re.escape(needle)):
+                ht.resolve_profile(bad, "")
+
+    def test_a_launcher_needs_the_name_of_the_agent_it_starts_and_vice_versa(self):
+        with self.assertRaisesRegex(ht.HerdrError, "spawn.agent"):
+            ht.resolve_profile({"spawn": {"command": "./start {key}"}}, "")
+        with self.assertRaisesRegex(ht.HerdrError, "spawn.command"):
+            ht.resolve_profile({"spawn": {"agent": "session-{key}"}}, "")
+
+
+class FillCommand(unittest.TestCase):
+    def test_fills_each_placeholder_inside_its_own_argument(self):
+        argv = ht.fill_command("./start {key} --branch {branch} --no-focus", {"key": "42", "branch": "feat/x y"})
+        self.assertEqual(argv, ["./start", "42", "--branch", "feat/x y", "--no-focus"])
+
+    def test_a_value_is_never_split_or_read_as_shell(self):
+        argv = ht.fill_command("./start {key}", {"key": "1; rm -rf ~"})
+        self.assertEqual(argv, ["./start", "1; rm -rf ~"])
+
+    def test_refuses_a_placeholder_it_has_no_value_for(self):
+        with self.assertRaisesRegex(ht.HerdrError, r"\{branch\}"):
+            ht.fill_command("./start {key} {branch}", {"key": "42"})
+
+
+class FakeLauncherHerdr:
+    """Stands in for herdr while a repo's launcher starts an agent: agent list is empty for the first reads."""
+
+    def __init__(self, empty_lists=1, screen="> ", name="session-42"):
+        self.empty_lists, self.screen, self.name, self.calls = empty_lists, screen, name, []
+
+    def __call__(self, *args, parse=True):
+        self.calls.append(args)
+        if args[:2] == ("agent", "list"):
+            if self.empty_lists > 0:
+                self.empty_lists -= 1
+                return {"result": {"agents": []}}
+            return {"result": {"agents": [{"name": self.name, "agent": "claude", "agent_status": "idle",
+                                           "workspace_id": "w9", "pane_id": "w9:p1"}]}}
+        if args[:2] == ("agent", "read"):
+            return self.screen
+        raise AssertionError("unexpected herdr call: %r" % (args,))
+
+
+class RepoLaunch(AgentHerdrTest):
+    def setUp(self):
+        super().setUp()
+        self.ran = []
+
+    def runner(self, returncode=0, stdout="placed session-42\n", stderr=""):
+        def run(argv, **kwargs):
+            self.ran.append((argv, kwargs.get("cwd")))
+            return subprocess.CompletedProcess(argv, returncode, stdout, stderr)
+        return run
+
+    def launch(self, runner=None, timeout=30, **values):
+        profile = ht.resolve_profile(REPO_PROCESS, "")
+        return ht.repo_launch(REPO, profile, dict({"key": "42"}, **values), runner=runner or self.runner(),
+                              sleep=lambda s: None, timeout_seconds=timeout)
+
+    def test_runs_the_repos_launcher_from_the_main_checkout_and_waits_for_its_agent(self):
+        self.use(FakeLauncherHerdr(empty_lists=2))
+        summary = self.launch()
+        self.assertEqual(self.ran, [(["./scripts/start-session", "42", "--no-focus"], REPO)])
+        self.assertEqual((summary["agent"], summary["workspace_id"], summary["pane_id"]), ("session-42", "w9", "w9:p1"))
+        self.assertEqual((summary["brief"], summary["trust_prompt"]), (False, False))
+        self.assertIn("placed session-42", summary["output"])
+
+    def test_never_creates_a_worktree_or_starts_the_agent_itself(self):
+        fake = self.use(FakeLauncherHerdr())
+        self.launch()
+        self.assertFalse([c for c in fake.calls if c[:2] in (("worktree", "open"), ("agent", "start"),
+                                                             ("agent", "prompt"))])
+
+    def test_a_launcher_refusal_is_shown_as_it_said_and_nothing_else_runs(self):
+        fake = self.use(FakeLauncherHerdr())
+        with self.assertRaisesRegex(ht.HerdrError, "refused: workspace already open"):
+            self.launch(runner=self.runner(returncode=3, stdout="", stderr="refused: workspace already open"))
+        self.assertEqual(fake.calls, [])
+
+    def test_gives_up_naming_the_agent_when_it_never_appears(self):
+        self.use(FakeLauncherHerdr(empty_lists=10 ** 6))
+        with self.assertRaisesRegex(ht.HerdrError, "session-42"):
+            self.launch(timeout=3)
+
+    def test_reports_an_agent_waiting_at_the_folder_trust_prompt(self):
+        self.use(FakeLauncherHerdr(screen=TRUST_SCREEN))
+        self.assertTrue(self.launch()["trust_prompt"])
+
+    def test_a_repo_without_a_launcher_is_told_to_use_launch(self):
+        self.use(FakeLauncherHerdr())
+        with self.assertRaisesRegex(ht.HerdrError, "spawn.command"):
+            ht.repo_launch(REPO, ht.resolve_profile(None, ""), {"key": "42"}, runner=self.runner())
+
+
+class LandRefusedWhenTheRepoMerges(unittest.TestCase):
+    """retire.land: repo means the repository's own process merges; the helper never does, by any route."""
+
+    def setUp(self):
+        saved = ht.agent_profile, ht.cwd_profile, ht.land_loop, ht.retire_info
+        def restore():
+            ht.agent_profile, ht.cwd_profile, ht.land_loop, ht.retire_info = saved
+        self.addCleanup(restore)
+        repo = dict(ht.resolve_profile(REPO_PROCESS, ""), main_checkout=REPO, sources={"repo": REPO + "/x.json"})
+        ht.agent_profile = lambda target: repo
+        ht.cwd_profile = lambda: repo
+        self.looped = []
+        ht.land_loop = lambda *args, **kwargs: self.looped.append(args) or {"state": "merged"}
+
+        def no_retire_info(target):
+            raise AssertionError("retire_info must not run once landing is refused")
+        ht.retire_info = no_retire_info
+
+    def test_land_refuses_an_agent_in_such_a_repo(self):
+        with self.assertRaisesRegex(ht.HerdrError, "own process"):
+            ht.land("session-42")
+        self.assertEqual(self.looped, [])
+
+    def test_land_refuses_an_mr_named_from_inside_such_a_repo(self):
+        with self.assertRaisesRegex(ht.HerdrError, "own process"):
+            ht.land(None, mr="o/r!5")
+        self.assertEqual(self.looped, [])
+
+    def test_watch_refuses_before_it_starts_watching(self):
+        with self.assertRaisesRegex(ht.HerdrError, "session-42.*own process"):
+            ht.watch(["session-42"], max_hours=0.001, poll_seconds=0)
+
+    def test_landing_several_refuses_them_all_before_landing_any(self):
+        with self.assertRaisesRegex(ht.HerdrError, "own process"):
+            ht.land_several(["session-42", "session-43"])
+        self.assertEqual(self.looped, [])
+
+    def test_a_default_profile_still_lands(self):
+        default = dict(ht.resolve_profile(None, ""), main_checkout=REPO, sources={})
+        ht.cwd_profile = lambda: default
+        ht.land(None, mr="o/r!5")
+        self.assertEqual(len(self.looped), 1)
+
+    def test_an_mr_named_from_outside_any_repo_still_lands(self):
+        ht.cwd_profile = lambda: None
+        ht.land(None, mr="o/r!5")
+        self.assertEqual(len(self.looped), 1)
+
+
+class RetireChecksWhenTheRepoMerges(unittest.TestCase):
+    def test_an_open_mr_waits_on_the_repos_own_process_and_approval_is_its_business(self):
+        checks = checks_by_name(ht.retire_checks("idle", "", "opened", False, None, land_mode="repo",
+                                                 report_expected=False, approval={"approved": False}))
+        self.assertFalse(checks["merged"]["ok"])
+        self.assertIn("own process", checks["merged"]["detail"])
+        self.assertTrue(checks["approved"]["ok"])
+        self.assertIn("own process", checks["approved"]["detail"])
+
+    def test_once_merged_an_agent_without_a_brief_needs_no_status_report(self):
+        checks = ht.retire_checks("idle", "", "merged", True, None, land_mode="repo", report_expected=False)
+        self.assertTrue(all(c["ok"] for c in checks), checks)
+        self.assertIn("spawn.brief", checks_by_name(checks)["report"]["detail"])
+
+    def test_a_report_the_agent_wrote_anyway_still_gates(self):
+        report = ht.parse_status_report(REPORT.replace("safe_to_retire: yes", "safe_to_retire: no"))
+        checks = checks_by_name(ht.retire_checks("idle", "", "merged", True, report, report_expected=False))
+        self.assertFalse(checks["safe_to_retire"]["ok"])
+
+    def test_defaults_are_todays_checks(self):
+        self.assertEqual(ht.retire_checks("idle", "", "opened", True, None),
+                         ht.retire_checks("idle", "", "opened", True, None, land_mode="helper", report_expected=True))
+
+
+class RepoProcessExample(unittest.TestCase):
+    def test_the_repo_process_example_hands_spawn_and_landing_to_the_repo(self):
+        with open(os.path.join(EXAMPLES, "repo-process", ".claude", "herdr-profile.json")) as handle:
+            resolved = ht.resolve_profile(json.load(handle), "")
+        self.assertIn("{key}", resolved["spawn"]["command"])
+        self.assertEqual(resolved["retire"]["land"], "repo")
+        self.assertIn("{branch}", resolved["worktree"]["remove"])
+
+
+class CwdProfileFailsClosed(unittest.TestCase):
+    """Outside a git repo there is no profile to honour; inside one, a profile that can't be read must stop land --mr."""
+
+    def setUp(self):
+        self.repo = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.repo)
+        subprocess.run(["git", "init", "-q", self.repo], check=True)
+        subprocess.run(["git", "-C", self.repo, "remote", "add", "origin", "git@github.com:o/r.git"], check=True)
+        saved_cwd, saved_loop = os.getcwd(), ht.land_loop
+        self.looped = []
+        ht.land_loop = lambda *args, **kwargs: self.looped.append(args) or {"state": "merged"}
+
+        def restore():
+            os.chdir(saved_cwd)
+            ht.land_loop = saved_loop
+        self.addCleanup(restore)
+        os.chdir(self.repo)
+
+    def write(self, text):
+        os.makedirs(os.path.join(self.repo, ".claude"), exist_ok=True)
+        with open(os.path.join(self.repo, ".claude", "herdr-profile.json"), "w") as handle:
+            handle.write(text)
+
+    def test_a_malformed_or_mistyped_profile_stops_land_mr_before_any_forge_call(self):
+        for text in ('{"retire":{"land":"Repo"}}', '{"retire":{"land":"repo"},}',
+                     '{"retire":{"land":"repo","branch_clean":"repo"}}'):
+            self.write(text)
+            with self.assertRaises(ht.HerdrError, msg=text):
+                ht.land(None, mr="o/r!5")
+        self.assertEqual(self.looped, [])
+
+    def test_a_valid_repo_mode_profile_refuses_and_a_default_one_lands(self):
+        self.write('{"retire":{"land":"repo"}}')
+        with self.assertRaisesRegex(ht.HerdrError, "own process"):
+            ht.land(None, mr="o/r!5")
+        self.write('{"name":"r"}')
+        ht.land(None, mr="o/r!5")
+        self.assertEqual(len(self.looped), 1)
+
+    def test_outside_any_git_repo_there_is_no_profile(self):
+        outside = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, outside)
+        self.addCleanup(os.chdir, os.getcwd())  # runs first: Windows can't remove the folder it is standing in
+        os.chdir(outside)
+        self.assertIsNone(ht.cwd_profile())
+
+
+class OverlayCannotLoosenTheRepo(unittest.TestCase):
+    def setUp(self):
+        self.main, self.overlays = tempfile.mkdtemp(), tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.main)
+        self.addCleanup(shutil.rmtree, self.overlays)
+        os.makedirs(os.path.join(self.main, ".claude"))
+        with open(os.path.join(self.main, ".claude", "herdr-profile.json"), "w") as handle:
+            json.dump({"retire": {"land": "repo", "branch_cleanup": "repo"}}, handle)
+
+    def overlay(self, data):
+        with open(os.path.join(self.overlays, "mine.json"), "w") as handle:
+            json.dump(dict({"match": {"path": self.main}}, **data), handle)
+
+    def test_an_overlay_may_not_hand_merging_or_branch_cleanup_back_to_the_helper(self):
+        for retire in ({"land": "helper"}, {"branch_cleanup": "helper"}):
+            self.overlay({"retire": retire})
+            with self.assertRaisesRegex(ht.HerdrError, "overlay"):
+                ht.load_profile(self.main, "", self.overlays)
+
+    def test_a_retire_that_is_not_an_object_is_a_clean_refusal(self):
+        self.overlay({"retire": "helper"})
+        with self.assertRaisesRegex(ht.HerdrError, "retire must be an object"):
+            ht.load_profile(self.main, "", self.overlays)
+
+    def test_an_overlay_may_still_add_personal_fields(self):
+        self.overlay({"worktree": {"remove": "./finish --lane mine {branch}"}})
+        profile, _ = ht.load_profile(self.main, "", self.overlays)
+        self.assertEqual(profile["retire"]["land"], "repo")
+        self.assertIn("--lane mine", profile["worktree"]["remove"])
+
+
+class RepoLaunchRobustness(AgentHerdrTest):
+    def launch(self, key="42", runner=None):
+        return ht.repo_launch(REPO, ht.resolve_profile(REPO_PROCESS, ""), {"key": key},
+                              runner=runner or (lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "", "")),
+                              sleep=lambda s: None, timeout_seconds=1)
+
+    def test_a_key_that_would_read_as_an_option_is_refused(self):
+        self.use(FakeLauncherHerdr())
+        for key in ("-rf", "--relaunch", "", "a b"):
+            with self.assertRaisesRegex(ht.HerdrError, "key"):
+                self.launch(key=key)
+
+    def test_a_launcher_that_cannot_start_is_a_clean_refusal(self):
+        self.use(FakeLauncherHerdr())
+        def missing(argv, **kwargs):
+            raise FileNotFoundError(2, "No such file or directory", argv[0])
+        with self.assertRaisesRegex(ht.HerdrError, "Could not run"):
+            self.launch(runner=missing)
+
+    def test_a_launcher_that_hangs_is_stopped_and_reported(self):
+        self.use(FakeLauncherHerdr())
+        def hang(argv, **kwargs):
+            raise subprocess.TimeoutExpired(argv, kwargs.get("timeout"))
+        with self.assertRaisesRegex(ht.HerdrError, "did not finish"):
+            self.launch(runner=hang)

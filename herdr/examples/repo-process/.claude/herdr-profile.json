@@ -1,0 +1,21 @@
+{
+  "name": "acme-platform",
+  "forge": "github",
+  "spawn": {
+    "command": "./scripts/start-session {key} --no-focus",
+    "agent": "session-{key}",
+    "brief": false
+  },
+  "retire": {
+    "land": "repo",
+    "branch_cleanup": "repo"
+  },
+  "worktree": {
+    "remove": "./scripts/finish-branch --branch {branch}"
+  },
+  "brief": {
+    "notes": [
+      "This repository runs its own ticket process: read CONTRIBUTING.md before changing anything, and never merge from a herdr skill."
+    ]
+  }
+}
