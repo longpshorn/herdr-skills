@@ -1857,3 +1857,102 @@ class RepoProcessExample(unittest.TestCase):
         self.assertIn("{key}", resolved["spawn"]["command"])
         self.assertEqual(resolved["retire"]["land"], "repo")
         self.assertIn("{branch}", resolved["worktree"]["remove"])
+
+
+class CwdProfileFailsClosed(unittest.TestCase):
+    """Outside a git repo there is no profile to honour; inside one, a profile that can't be read must stop land --mr."""
+
+    def setUp(self):
+        self.repo = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.repo)
+        subprocess.run(["git", "init", "-q", self.repo], check=True)
+        subprocess.run(["git", "-C", self.repo, "remote", "add", "origin", "git@github.com:o/r.git"], check=True)
+        saved_cwd, saved_loop = os.getcwd(), ht.land_loop
+        self.looped = []
+        ht.land_loop = lambda *args, **kwargs: self.looped.append(args) or {"state": "merged"}
+
+        def restore():
+            os.chdir(saved_cwd)
+            ht.land_loop = saved_loop
+        self.addCleanup(restore)
+        os.chdir(self.repo)
+
+    def write(self, text):
+        os.makedirs(os.path.join(self.repo, ".claude"), exist_ok=True)
+        with open(os.path.join(self.repo, ".claude", "herdr-profile.json"), "w") as handle:
+            handle.write(text)
+
+    def test_a_malformed_or_mistyped_profile_stops_land_mr_before_any_forge_call(self):
+        for text in ('{"retire":{"land":"Repo"}}', '{"retire":{"land":"repo"},}',
+                     '{"retire":{"land":"repo","branch_clean":"repo"}}'):
+            self.write(text)
+            with self.assertRaises(ht.HerdrError, msg=text):
+                ht.land(None, mr="o/r!5")
+        self.assertEqual(self.looped, [])
+
+    def test_a_valid_repo_mode_profile_refuses_and_a_default_one_lands(self):
+        self.write('{"retire":{"land":"repo"}}')
+        with self.assertRaisesRegex(ht.HerdrError, "own process"):
+            ht.land(None, mr="o/r!5")
+        self.write('{"name":"r"}')
+        ht.land(None, mr="o/r!5")
+        self.assertEqual(len(self.looped), 1)
+
+    def test_outside_any_git_repo_there_is_no_profile(self):
+        outside = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, outside)
+        os.chdir(outside)
+        self.assertIsNone(ht.cwd_profile())
+
+
+class OverlayCannotLoosenTheRepo(unittest.TestCase):
+    def setUp(self):
+        self.main, self.overlays = tempfile.mkdtemp(), tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.main)
+        self.addCleanup(shutil.rmtree, self.overlays)
+        os.makedirs(os.path.join(self.main, ".claude"))
+        with open(os.path.join(self.main, ".claude", "herdr-profile.json"), "w") as handle:
+            json.dump({"retire": {"land": "repo", "branch_cleanup": "repo"}}, handle)
+
+    def overlay(self, data):
+        with open(os.path.join(self.overlays, "mine.json"), "w") as handle:
+            json.dump(dict({"match": {"path": self.main}}, **data), handle)
+
+    def test_an_overlay_may_not_hand_merging_or_branch_cleanup_back_to_the_helper(self):
+        for retire in ({"land": "helper"}, {"branch_cleanup": "helper"}):
+            self.overlay({"retire": retire})
+            with self.assertRaisesRegex(ht.HerdrError, "overlay"):
+                ht.load_profile(self.main, "", self.overlays)
+
+    def test_an_overlay_may_still_add_personal_fields(self):
+        self.overlay({"worktree": {"remove": "./finish --lane mine {branch}"}})
+        profile, _ = ht.load_profile(self.main, "", self.overlays)
+        self.assertEqual(profile["retire"]["land"], "repo")
+        self.assertIn("--lane mine", profile["worktree"]["remove"])
+
+
+class RepoLaunchRobustness(AgentHerdrTest):
+    def launch(self, key="42", runner=None):
+        return ht.repo_launch(REPO, ht.resolve_profile(REPO_PROCESS, ""), {"key": key},
+                              runner=runner or (lambda argv, **kw: subprocess.CompletedProcess(argv, 0, "", "")),
+                              sleep=lambda s: None, timeout_seconds=1)
+
+    def test_a_key_that_would_read_as_an_option_is_refused(self):
+        self.use(FakeLauncherHerdr())
+        for key in ("-rf", "--relaunch", "", "a b"):
+            with self.assertRaisesRegex(ht.HerdrError, "key"):
+                self.launch(key=key)
+
+    def test_a_launcher_that_cannot_start_is_a_clean_refusal(self):
+        self.use(FakeLauncherHerdr())
+        def missing(argv, **kwargs):
+            raise FileNotFoundError(2, "No such file or directory", argv[0])
+        with self.assertRaisesRegex(ht.HerdrError, "Could not run"):
+            self.launch(runner=missing)
+
+    def test_a_launcher_that_hangs_is_stopped_and_reported(self):
+        self.use(FakeLauncherHerdr())
+        def hang(argv, **kwargs):
+            raise subprocess.TimeoutExpired(argv, kwargs.get("timeout"))
+        with self.assertRaisesRegex(ht.HerdrError, "did not finish"):
+            self.launch(runner=hang)

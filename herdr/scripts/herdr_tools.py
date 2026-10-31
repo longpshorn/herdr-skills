@@ -423,8 +423,16 @@ def load_profile(main_checkout, remote_url, overlay_dir=OVERLAY_DIR):
         for name in sorted(os.listdir(overlay_dir)):
             path = os.path.join(overlay_dir, name)
             if name.endswith(".json") and select_profile([read_json(path)], main_checkout, remote_url):
+                repo_retire = (profile or {}).get("retire") or {}
                 profile = merge_profiles(profile or {}, read_json(path))
                 sources["overlay"] = path
+                loosened = [k for k in sorted(RETIRE_KEYS) if repo_retire.get(k) == "repo"
+                            and ((profile.get("retire") or {}).get(k) or "helper") != "repo"]
+                if loosened:
+                    raise HerdrError(
+                        "The overlay %s sets retire.%s back to the helper, but the repo's profile %s hands it to the "
+                        "repository's own process. An overlay can add personal fields; it can't loosen the repo's "
+                        "process. Remove that field from the overlay." % (path, "/".join(loosened), repo_path))
                 break
     return profile, sources
 
@@ -1143,11 +1151,14 @@ def agent_profile(target):
 
 
 def cwd_profile():
-    """The resolved profile of the repo the helper runs in, or None outside a git repository."""
+    """The resolved profile of the repo the helper runs in, or None outside a git repository. Only "not a repository"
+    means no profile: a profile that can't be read or fails validation raises, so `land --mr` stops rather than
+    merging past a repo whose file was meant to forbid it."""
     try:
-        return project_profile(repo_root(os.getcwd()))
+        main = repo_root(os.getcwd())
     except HerdrError:
         return None
+    return project_profile(main)
 
 
 def refuse_repo_land(profile, what):
@@ -1167,7 +1178,8 @@ def land(target, timeout_minutes=30, poll_seconds=20, mr=None):
     by URL or `group/project!iid`, which may live in any repo.
 
     Refused for a repo whose profile sets retire.land to "repo": the agent's repo, or for --mr the repo the helper runs
-    in. (An MR named by URL from outside that repo can't be traced to a profile, so run --mr from its checkout.)"""
+    in. Two routes can't be traced to a profile: --mr run from outside that repo's checkout, and an agent whose status
+    report names an MR in another repo (only the agent's own repo is checked). Name such an MR from its checkout."""
     if mr is not None:
         refuse_repo_land(cwd_profile(), mr)
         ref = parse_mr_ref(mr)
@@ -1469,10 +1481,11 @@ def launch(path, label, name, kind, prompt, sleep=time.sleep, busy_timeout_secon
 
 
 REPO_LAUNCH_TIMEOUT = 120
+REPO_LAUNCH_KEY = re.compile(r"^[A-Za-z0-9#][A-Za-z0-9._/#-]*$")
 
 
 def repo_launch(main_checkout, profile, values, runner=subprocess.run, sleep=time.sleep,
-                timeout_seconds=REPO_LAUNCH_TIMEOUT, poll_seconds=2):
+                timeout_seconds=REPO_LAUNCH_TIMEOUT, poll_seconds=2, launcher_timeout_seconds=300):
     """Spawn through the repository's own launcher (spawn.command) instead of `launch`: run it from the main checkout
     with VALUES filled in ({key}, {branch}, ...), then wait for the agent it names (spawn.agent) to appear. The launcher
     owns the worktree, the workspace and starting the agent; this never creates or starts either. A refusal (non-zero
@@ -1480,11 +1493,22 @@ def repo_launch(main_checkout, profile, values, runner=subprocess.run, sleep=tim
     spawn = profile["spawn"]
     if not spawn["command"]:
         raise HerdrError("This repo's profile has no spawn.command; use `launch` (the default spawn flow).")
+    key = values.get("key")
+    if not isinstance(key, str) or not REPO_LAUNCH_KEY.match(key):
+        raise HerdrError("The key %r can't be passed to the repo's launcher: use letters, digits, '.', '_', '/', '-' "
+                         "or '#', starting with a letter, digit or '#' (so it can't read as an option)." % key)
     argv = fill_command(spawn["command"], values)
     name = PLACEHOLDER.sub(lambda m: str(values.get(m.group(1), m.group(0))), spawn["agent"])
     if not re.match(r"^[a-z][a-z0-9_-]{0,31}$", name):
         raise HerdrError("spawn.agent resolved to %r, which is not a Herdr agent name." % name)
-    proc = runner(argv, capture_output=True, text=True, cwd=main_checkout)
+    try:
+        proc = runner(argv, capture_output=True, text=True, cwd=main_checkout, timeout=launcher_timeout_seconds)
+    except subprocess.TimeoutExpired:
+        raise HerdrError("The repo's launcher did not finish within %gs: %s. Check the workspace it may have opened "
+                         "before running it again." % (launcher_timeout_seconds, " ".join(argv)))
+    except OSError as error:
+        raise HerdrError("Could not run the repo's launcher %s: %s. On Windows, write spawn.command with forward "
+                         "slashes or quote a path with backslashes." % (argv[0], error))
     output = "\n".join(part.strip() for part in (proc.stdout, proc.stderr) if part and part.strip())
     if proc.returncode != 0:
         raise HerdrError("The repo's launcher refused (exit %d): %s\n%s" % (proc.returncode, " ".join(argv),
