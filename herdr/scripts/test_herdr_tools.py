@@ -2336,3 +2336,27 @@ class WorkToolsFromInstalledSkills(unittest.TestCase):
         self.mark("work-new", {"plugin": "work", "skill": "new", "root": os.path.join(self.tmp, "gone")})
         self.mark("work-bad", ["not", "a", "dict"])
         self.assertIsNone(ht.work_tools_path(os.path.join(self.tmp, "no-plugins"), {"agents": self.skills}))
+
+
+class SkillTextIsToolNeutral(unittest.TestCase):
+    """A Claude Code-only tool named in skill text always comes with what to do in any other agent."""
+
+    CLAUDE_ONLY = ("run_in_background", "AskUserQuestion", "/permissions")
+
+    def test_claude_code_only_tools_are_named_only_beside_an_alternative(self):
+        offenders = []
+        for folder, _, files in os.walk(os.path.join(PLUGIN_ROOT, "skills")):
+            for name in (n for n in files if n.endswith(".md")):
+                with open(os.path.join(folder, name), encoding="utf-8") as handle:
+                    for number, line in enumerate(handle, 1):
+                        for tool in self.CLAUDE_ONLY:
+                            if tool in line and not re.search(r"Claude Code: `%s`[^)]*elsewhere" % re.escape(tool),
+                                                              line):
+                                offenders.append("%s:%d: %s" % (name, number, tool))
+        self.assertEqual(offenders, [])
+
+    def test_the_trust_prompt_is_not_called_claudes(self):
+        for folder, _, files in os.walk(os.path.join(PLUGIN_ROOT, "skills")):
+            for name in (n for n in files if n.endswith(".md")):
+                with open(os.path.join(folder, name), encoding="utf-8") as handle:
+                    self.assertNotIn("Claude's folder-trust", handle.read(), name)
