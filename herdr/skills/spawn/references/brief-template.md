@@ -1,6 +1,6 @@
 # Brief template
 
-Fill every section from the ticket, the repo's `CLAUDE.md`, the project's herdr profile (`herdr_tools.py profile --path <repo>`) and what the conversation established. Cut a section only when it truly has nothing to say. Write it for an agent with no context: state facts and paths, not history.
+Fill every section from the ticket, the repo's `CLAUDE.md`, the project's herdr profile (`herdr_tools.py profile --path "<repo>"`) and what the conversation established. Cut a section only when it truly has nothing to say. Write it for an agent with no context: state facts and paths, not history.
 
 ```markdown
 # Brief: <KEY>, <one-line goal>
