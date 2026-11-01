@@ -1,6 +1,6 @@
 # Brief template
 
-Fill every section from the ticket, the repo's `CLAUDE.md`, the project's herdr profile (`herdr_tools.py profile --path "<repo>"`) and what the conversation established. Cut a section only when it truly has nothing to say. Write it for an agent with no context: state facts and paths, not history.
+Fill every section from the ticket, the repo's `AGENTS.md` (or `CLAUDE.md`), the project's herdr profile (`herdr_tools.py profile --path "<repo>"`) and what the conversation established. Cut a section only when it truly has nothing to say. Write it for an agent with no context: state facts and paths, not history.
 
 ```markdown
 # Brief: <KEY>, <one-line goal>
@@ -20,7 +20,7 @@ You are implementing **<KEY>** "<ticket title>" (<tracker>) in the <repo> repo, 
 
 ## Read first
 
-<The repo CLAUDE.md, the ADRs and package/feature CLAUDE.md files in scope, and the existing code to start from.>
+<The repo AGENTS.md (or CLAUDE.md), the ADRs and package/feature AGENTS.md or CLAUDE.md files in scope, and the existing code to start from.>
 
 ## Acceptance criteria / the owner's direction
 
