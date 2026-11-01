@@ -2089,3 +2089,250 @@ class WorkToolsPath(unittest.TestCase):
     def test_the_default_reads_the_suites_empty_home_not_the_real_one(self):
         self.assertEqual(os.path.expanduser("~"), SUITE_HOME)
         self.assertIsNone(ht.work_tools_path())
+
+
+PLUGIN_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+SKILL_TEXT = """---
+name: spawn
+description: Start an agent. Use for "/herdr:spawn <ticket>".
+---
+
+# Spawn — one ticket
+
+Helper: `sh "${CLAUDE_PLUGIN_ROOT}/scripts/herdr-tools"`. See [PROFILES.md](${CLAUDE_PLUGIN_ROOT}/PROFILES.md).
+"""
+
+
+class RenderSkill(unittest.TestCase):
+    """Other agents don't set ${CLAUDE_PLUGIN_ROOT}: install-skills writes the plugin's absolute root in its place."""
+
+    def render(self, root="/home/u/herdr-skills/herdr"):
+        return ht.render_skill(SKILL_TEXT, "herdr", "spawn", root)
+
+    def test_replaces_the_plugin_root(self):
+        text = self.render()
+        self.assertNotIn("CLAUDE_PLUGIN_ROOT", text)
+        self.assertIn('`sh "/home/u/herdr-skills/herdr/scripts/herdr-tools"`', text)
+        self.assertIn("(/home/u/herdr-skills/herdr/PROFILES.md)", text)
+
+    def test_a_windows_root_uses_forward_slashes(self):
+        self.assertIn('sh "C:/Users/u/herdr-skills/herdr/scripts/herdr-tools"',
+                      self.render("C:\\Users\\u\\herdr-skills\\herdr"))
+
+    def test_prefixes_the_name_with_the_plugin(self):
+        text = self.render()
+        self.assertIn("\nname: herdr-spawn\n", text)
+        self.assertNotIn("\nname: spawn\n", text)
+
+    def test_says_how_the_claude_names_map_and_how_to_update(self):
+        text = self.render()
+        note = text.split("# Spawn — one ticket\n", 1)[1].lstrip("\n").split("\n", 1)[0]
+        self.assertTrue(note.startswith("> "), note)
+        self.assertIn("`/herdr:<name>`", note)
+        self.assertIn("`herdr-<name>`", note)
+        self.assertIn('sh "/home/u/herdr-skills/herdr/scripts/herdr-tools" install-skills --update', note)
+
+    def test_a_reference_file_only_gets_the_root(self):
+        text = ht.render_file("Read `${CLAUDE_PLUGIN_ROOT}/skills/spawn/references/brief-template.md`.", "/r/herdr")
+        self.assertEqual(text, "Read `/r/herdr/skills/spawn/references/brief-template.md`.")
+
+
+class SkillDirs(unittest.TestCase):
+    """One table names each tool's user-scope skills folder."""
+
+    def test_every_tool_has_a_folder_and_agents_is_the_default(self):
+        dirs = ht.skill_dirs(env={})
+        home = os.path.expanduser("~")
+        self.assertEqual(dirs["agents"], os.path.join(home, ".agents", "skills"))
+        self.assertEqual(dirs["codex"], dirs["agents"])
+        self.assertEqual(dirs["gemini"], os.path.join(home, ".gemini", "skills"))
+        self.assertEqual(dirs["opencode"], os.path.join(home, ".config", "opencode", "skills"))
+        self.assertEqual(dirs["omp"], os.path.join(home, ".omp", "agent", "skills"))
+        self.assertEqual(ht.DEFAULT_SKILLS_TOOL, "agents")
+
+    def test_opencode_honours_xdg_config_home(self):
+        self.assertEqual(ht.skill_dirs(env={"XDG_CONFIG_HOME": "/x/cfg"})["opencode"],
+                         os.path.join("/x/cfg", "opencode", "skills"))
+
+
+class InstallSkills(unittest.TestCase):
+    """install-skills writes rendered copies it can find and replace again, and never touches a folder it didn't write."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.dest = os.path.join(self.tmp, "skills")
+
+    def install(self, **options):
+        return ht.install_skills(PLUGIN_ROOT, self.dest, tool="agents", commit="abc123", **options)
+
+    def read(self, *parts):
+        with open(os.path.join(self.dest, *parts), encoding="utf-8") as handle:
+            return handle.read()
+
+    def test_writes_every_skill_rendered_with_its_references_and_a_marker(self):
+        result = self.install()
+        skills = sorted(os.listdir(os.path.join(PLUGIN_ROOT, "skills")))
+        self.assertEqual(sorted(result["installed"]), ["herdr-" + s for s in skills])
+        self.assertEqual(sorted(os.listdir(self.dest)), ["herdr-" + s for s in skills])
+        spawn = self.read("herdr-spawn", "SKILL.md")
+        self.assertIn("name: herdr-spawn", spawn)
+        self.assertNotIn("CLAUDE_PLUGIN_ROOT", spawn)
+        self.assertIn(PLUGIN_ROOT.replace("\\", "/") + "/scripts/herdr-tools", spawn)
+        self.assertNotIn("CLAUDE_PLUGIN_ROOT", self.read("herdr-spawn", "references", "brief-template.md"))
+        marker = json.loads(self.read("herdr-spawn", ht.SKILLS_MARKER))
+        self.assertEqual(marker, {"plugin": "herdr", "skill": "spawn", "root": PLUGIN_ROOT, "tool": "agents",
+                                  "commit": "abc123"})
+
+    def test_a_dry_run_writes_nothing(self):
+        result = self.install(dry_run=True)
+        self.assertTrue(result["installed"])
+        self.assertFalse(os.path.exists(self.dest))
+
+    def test_installing_again_replaces_its_own_copies(self):
+        self.install()
+        with open(os.path.join(self.dest, "herdr-spawn", "stale.md"), "w") as handle:
+            handle.write("old")
+        self.install()
+        self.assertFalse(os.path.exists(os.path.join(self.dest, "herdr-spawn", "stale.md")))
+
+    def test_refuses_a_folder_it_did_not_write_and_writes_nothing(self):
+        os.makedirs(os.path.join(self.dest, "herdr-status"))
+        with open(os.path.join(self.dest, "herdr-status", "SKILL.md"), "w") as handle:
+            handle.write("mine")
+        with self.assertRaises(ht.HerdrError) as caught:
+            self.install()
+        self.assertIn("herdr-status", str(caught.exception))
+        self.assertEqual(os.listdir(self.dest), ["herdr-status"])
+        self.assertEqual(self.read("herdr-status", "SKILL.md"), "mine")
+
+    def test_removes_its_copy_of_a_skill_the_plugin_no_longer_has(self):
+        self.install()
+        gone = os.path.join(self.dest, "herdr-gone")
+        os.makedirs(gone)
+        with open(os.path.join(gone, ht.SKILLS_MARKER), "w") as handle:
+            json.dump({"plugin": "herdr", "skill": "gone"}, handle)
+        result = self.install()
+        self.assertEqual(result["removed"], ["herdr-gone"])
+        self.assertFalse(os.path.exists(gone))
+
+    def test_leaves_other_plugins_skills_alone(self):
+        other = os.path.join(self.dest, "work-checkpoint")
+        os.makedirs(other)
+        with open(os.path.join(other, ht.SKILLS_MARKER), "w") as handle:
+            json.dump({"plugin": "work", "skill": "checkpoint"}, handle)
+        self.install()
+        ht.uninstall_skills(self.dest)
+        self.assertEqual(os.listdir(self.dest), ["work-checkpoint"])
+
+    def test_uninstall_removes_only_its_own_copies(self):
+        self.install()
+        os.makedirs(os.path.join(self.dest, "herdr-mine"))
+        result = ht.uninstall_skills(self.dest)
+        self.assertIn("herdr-spawn", result["removed"])
+        self.assertEqual(os.listdir(self.dest), ["herdr-mine"])
+
+    def test_uninstall_dry_run_and_a_missing_folder_remove_nothing(self):
+        self.install()
+        self.assertTrue(ht.uninstall_skills(self.dest, dry_run=True)["removed"])
+        self.assertIn("herdr-spawn", os.listdir(self.dest))
+        self.assertEqual(ht.uninstall_skills(os.path.join(self.tmp, "nowhere"))["removed"], [])
+
+    def test_gemini_gets_a_note_about_agents_md_and_nothing_is_written_for_it(self):
+        result = ht.install_skills(PLUGIN_ROOT, self.dest, tool="gemini", commit="abc123")
+        self.assertTrue(any("AGENTS.md" in note and "settings.json" in note for note in result["notes"]))
+        self.assertEqual(sorted(os.listdir(self.tmp)), ["skills"])
+
+
+class InstalledSkillDirs(unittest.TestCase):
+    """--update finds every folder it installed into from the markers, and re-renders each for its tool."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp)
+
+    def test_finds_the_folders_holding_a_plugins_copies_once_each(self):
+        a, b, c = (os.path.join(self.tmp, n) for n in ("a", "b", "c"))
+        ht.install_skills(PLUGIN_ROOT, a, tool="agents", commit="x")
+        ht.install_skills(PLUGIN_ROOT, b, tool="omp", commit="x")
+        os.makedirs(c)
+        dirs = {"agents": a, "codex": a, "omp": b, "gemini": c, "opencode": os.path.join(self.tmp, "none")}
+        self.assertEqual(ht.installed_skill_dirs("herdr", dirs), [(a, "agents"), (b, "omp")])
+        self.assertEqual(ht.installed_skill_dirs("work", dirs), [])
+
+    def test_refresh_re_renders_each_installed_folder(self):
+        a = os.path.join(self.tmp, "a")
+        ht.install_skills(PLUGIN_ROOT, a, tool="agents", commit="old")
+        result = ht.refresh_skills(PLUGIN_ROOT, {"agents": a}, commit="new")
+        self.assertEqual([r["dest"] for r in result], [a])
+        with open(os.path.join(a, "herdr-spawn", ht.SKILLS_MARKER)) as handle:
+            self.assertEqual(json.load(handle)["commit"], "new")
+
+
+class InstallSkillsCommand(unittest.TestCase):
+    """The command runs outside Herdr, installs from a git clone only, and --update pulls before re-rendering."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.dest = os.path.join(self.tmp, "skills")
+
+    def run_main(self, *argv):
+        out, err = io.StringIO(), io.StringIO()
+        saved = os.environ.pop("HERDR_ENV", None)
+        self.addCleanup(lambda: saved is not None and os.environ.__setitem__("HERDR_ENV", saved))
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = ht.main(list(argv))
+        return code, out.getvalue(), err.getvalue()
+
+    def test_installs_into_dest_outside_herdr(self):
+        code, out, err = self.run_main("install-skills", "--dest", self.dest)
+        self.assertEqual(code, 0, err)
+        self.assertIn("herdr-spawn", os.listdir(self.dest))
+        self.assertIn(self.dest, out)
+
+    def test_refuses_a_root_outside_a_git_checkout(self):
+        copy = os.path.join(self.tmp, "cache", "herdr")
+        shutil.copytree(os.path.join(PLUGIN_ROOT, "skills"), os.path.join(copy, "skills"))
+        with self.assertRaises(ht.HerdrError) as caught:
+            ht.plugin_commit(copy)
+        self.assertIn("clone", str(caught.exception))
+
+    def test_update_refuses_a_clone_with_local_changes(self):
+        clone = os.path.join(self.tmp, "clone")
+        subprocess.run(["git", "init", "-q", clone], check=True)
+        with open(os.path.join(clone, "dirty.txt"), "w") as handle:
+            handle.write("x")
+        with self.assertRaises(ht.HerdrError) as caught:
+            ht.pull_plugin(clone)
+        self.assertIn("local changes", str(caught.exception))
+
+
+class WorkToolsFromInstalledSkills(unittest.TestCase):
+    """Without the Claude Code plugin, retire finds work's launcher through the marker of a work skill install-skills
+    wrote (work-skills uses the same marker)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.skills = os.path.join(self.tmp, "skills")
+        self.root = os.path.join(self.tmp, "work-skills", "work")
+        os.makedirs(os.path.join(self.root, "scripts"))
+        open(os.path.join(self.root, "scripts", "work-tools"), "w").close()
+
+    def mark(self, folder, data):
+        os.makedirs(os.path.join(self.skills, folder))
+        with open(os.path.join(self.skills, folder, ht.SKILLS_MARKER), "w") as handle:
+            json.dump(data, handle)
+
+    def test_finds_the_launcher_from_a_work_skills_marker(self):
+        self.mark("work-checkpoint", {"plugin": "work", "skill": "checkpoint", "root": self.root})
+        self.assertEqual(ht.work_tools_path(os.path.join(self.tmp, "no-plugins"), {"agents": self.skills}),
+                         os.path.join(self.root, "scripts", "work-tools"))
+
+    def test_none_when_the_marker_is_another_plugins_or_its_launcher_is_gone(self):
+        self.mark("herdr-status", {"plugin": "herdr", "skill": "status", "root": self.root})
+        self.mark("work-new", {"plugin": "work", "skill": "new", "root": os.path.join(self.tmp, "gone")})
+        self.mark("work-bad", ["not", "a", "dict"])
+        self.assertIsNone(ht.work_tools_path(os.path.join(self.tmp, "no-plugins"), {"agents": self.skills}))

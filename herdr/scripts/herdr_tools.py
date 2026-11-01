@@ -47,6 +47,12 @@
   herdr_tools.py profile --path REPO
       The project's resolved profile: the repo's .claude/herdr-profile.json, with a personal overlay from
       ~/.config/herdr/profiles/ (matched by origin URL or path) laid over it, over the defaults.
+  herdr_tools.py install-skills [--tool agents|codex|gemini|opencode|omp] [--dest DIR] [--dry-run]
+  herdr_tools.py install-skills --update [--no-pull] [--tool T | --dest DIR] | --uninstall [--tool T | --dest DIR]
+      For coding agents other than Claude Code (and outside Herdr too): write rendered copies of the skills, named
+      herdr-<skill>, with ${CLAUDE_PLUGIN_ROOT} replaced by this clone's plugin folder, into the tool's skills folder
+      (default ~/.agents/skills, which Codex, Gemini CLI, OpenCode and omp all read). --update pulls the clone and
+      re-renders every copy it wrote; --uninstall removes them. Only folders holding its marker are ever replaced.
 
 Python 3.9 compatible (the macOS Command Line Tools python3). The skills run it through `sh herdr-tools`, which finds
 a Python 3.9+ as `python3`, `python` or `py -3`.
@@ -1056,9 +1062,10 @@ def read_json_or_none(path):
         return None
 
 
-def work_tools_path(plugins_dir=None):
+def work_tools_path(plugins_dir=None, skill_folders=None):
     """The launcher (scripts/work-tools) of the first installed, enabled `work` plugin that has one, or None.
-    A directory marketplace is read in place, so its plugin folder wins over the install cache."""
+    A directory marketplace is read in place, so its plugin folder wins over the install cache. Without the Claude
+    Code plugin, it is the root recorded by a work skill that install-skills wrote for another agent."""
     plugins_dir = plugins_dir or os.path.expanduser("~/.claude/plugins")
 
     def mapping(value):
@@ -1084,6 +1091,10 @@ def work_tools_path(plugins_dir=None):
             launcher = os.path.join(root, "scripts", "work-tools")
             if os.path.isfile(launcher):
                 return launcher
+    for root in installed_plugin_roots("work", skill_dirs() if skill_folders is None else skill_folders):
+        launcher = os.path.join(root, "scripts", "work-tools")
+        if os.path.isfile(launcher):
+            return launcher
     return None
 
 
@@ -1574,6 +1585,215 @@ def repo_launch(main_checkout, profile, values, runner=subprocess.run, sleep=tim
             "brief": spawn["brief"], "trust_prompt": has_trust_prompt(screen)}
 
 
+# ---- Skills for other coding agents ---------------------------------------------------------------------------------
+# Claude Code installs the plugin and substitutes ${CLAUDE_PLUGIN_ROOT} in skill text. Other agents (Codex, Gemini CLI,
+# OpenCode, omp) read plain skill folders and set no such variable, so install-skills writes rendered copies: the
+# placeholder becomes the clone's absolute plugin root, and each skill is named <plugin>-<skill> so generic names
+# (status, run) can't collide. A marker file in each copy records what wrote it, so only those copies are ever
+# replaced or removed, and --update finds them again. work-skills and adlc-skills use the same names and marker.
+
+PLUGIN_NAME = "herdr"
+PLUGIN_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT_PLACEHOLDER = "${CLAUDE_PLUGIN_ROOT}"
+SKILLS_MARKER = ".skills-install.json"
+DEFAULT_SKILLS_TOOL = "agents"
+# Each tool's user-scope skills folder, relative to home (opencode's to XDG_CONFIG_HOME, default ~/.config).
+# ~/.agents/skills is read by Codex (its documented user folder; ~/.codex/skills is deprecated), Gemini CLI (an alias
+# of ~/.gemini/skills), OpenCode and omp, so the default covers all four.
+SKILL_DIRS = {
+    "agents": (".agents", "skills"),
+    "codex": (".agents", "skills"),
+    "gemini": (".gemini", "skills"),
+    "opencode": ("<config>", "opencode", "skills"),
+    "omp": (".omp", "agent", "skills"),
+}
+SKILLS_NOTES = {
+    "gemini": "Gemini CLI reads GEMINI.md, not AGENTS.md, unless told to. To have it read a repo's AGENTS.md, add "
+              '"context": {"fileName": ["AGENTS.md", "GEMINI.md"]} to ~/.gemini/settings.json yourself; '
+              "install-skills never edits another tool's settings.",
+}
+
+
+def skill_dirs(env=None):
+    """{tool: its user-scope skills folder}, from SKILL_DIRS, resolved against this machine's home folder."""
+    env = os.environ if env is None else env
+    home = os.path.expanduser("~")
+    config = env.get("XDG_CONFIG_HOME") or os.path.join(home, ".config")
+    return {tool: os.path.join(config, *parts[1:]) if parts[0] == "<config>" else os.path.join(home, *parts)
+            for tool, parts in SKILL_DIRS.items()}
+
+
+def render_file(text, root):
+    """A skill file's text with ${CLAUDE_PLUGIN_ROOT} replaced by root, in forward slashes as Claude Code writes it."""
+    return text.replace(ROOT_PLACEHOLDER, root.replace("\\", "/"))
+
+
+def render_skill(text, plugin, skill, root):
+    """A SKILL.md for an agent other than Claude Code: the root filled in, the name <plugin>-<skill>, and a note
+    under the first heading on how the Claude Code names map and how to update the copy."""
+    text = render_file(text, root)
+    text = re.sub(r"(?m)\A(---\n(?:.*\n)*?)name: *%s *\n" % re.escape(skill),
+                  lambda m: "%sname: %s-%s\n" % (m.group(1), plugin, skill), text, count=1)
+    note = ("> Installed by install-skills for agents other than Claude Code. `/%s:<name>` in this text means the "
+            "`%s-<name>` skill. Don't edit this copy; to update it, run "
+            '`sh "%s/scripts/%s-tools" install-skills --update`.' % (plugin, plugin, root.replace("\\", "/"), plugin))
+    return re.sub(r"(?m)^(# .*\n)", lambda m: "%s\n%s\n" % (m.group(1), note), text, count=1)
+
+
+def skill_marker(folder):
+    marker = read_json_or_none(os.path.join(folder, SKILLS_MARKER))
+    return marker if isinstance(marker, dict) else None
+
+
+def plugin_copies(dest, plugin):
+    """{folder name: marker} of the copies of plugin's skills in dest."""
+    if not os.path.isdir(dest):
+        return {}
+    found = {}
+    for name in sorted(os.listdir(dest)):
+        marker = skill_marker(os.path.join(dest, name))
+        if marker and marker.get("plugin") == plugin:
+            found[name] = marker
+    return found
+
+
+def install_skills(plugin_root, dest, tool, commit, plugin=PLUGIN_NAME, dry_run=False):
+    """Write a rendered copy of each of plugin_root's skills into dest. Refuses, writing nothing, when a target folder
+    exists that this command didn't write; removes its own copies of skills the plugin no longer has."""
+    skills_root = os.path.join(plugin_root, "skills")
+    skills = sorted(n for n in os.listdir(skills_root) if os.path.isfile(os.path.join(skills_root, n, "SKILL.md")))
+    ours = plugin_copies(dest, plugin)
+    foreign = [plugin + "-" + s for s in skills
+               if os.path.exists(os.path.join(dest, plugin + "-" + s)) and plugin + "-" + s not in ours]
+    if foreign:
+        raise HerdrError("%s already holds %s, which install-skills did not write (no %s). Move or remove it, or "
+                         "install somewhere else with --dest." % (dest, ", ".join(foreign), SKILLS_MARKER))
+    stale = [name for name, marker in ours.items() if marker.get("skill") not in skills]
+    result = {"dest": dest, "tool": tool, "installed": [plugin + "-" + s for s in skills], "removed": stale,
+              "notes": [SKILLS_NOTES[tool]] if tool in SKILLS_NOTES else [], "dry_run": dry_run}
+    if dry_run:
+        return result
+    for name in stale:
+        shutil.rmtree(os.path.join(dest, name))
+    for skill in skills:
+        source, target = os.path.join(skills_root, skill), os.path.join(dest, plugin + "-" + skill)
+        if os.path.exists(target):
+            shutil.rmtree(target)
+        for folder, _, files in os.walk(source):
+            out = os.path.join(target, os.path.relpath(folder, source))
+            os.makedirs(out, exist_ok=True)
+            for name in files:
+                path = os.path.join(folder, name)
+                if name.endswith(".md"):
+                    with open(path, encoding="utf-8") as handle:
+                        text = handle.read()
+                    if folder == source and name == "SKILL.md":
+                        text = render_skill(text, plugin, skill, plugin_root)
+                    else:
+                        text = render_file(text, plugin_root)
+                    with open(os.path.join(out, name), "w", encoding="utf-8", newline="\n") as handle:
+                        handle.write(text)
+                else:
+                    shutil.copy2(path, os.path.join(out, name))
+        with open(os.path.join(target, SKILLS_MARKER), "w", encoding="utf-8") as handle:
+            json.dump({"plugin": plugin, "skill": skill, "root": plugin_root, "tool": tool, "commit": commit},
+                      handle, indent=2)
+    return result
+
+
+def uninstall_skills(dest, plugin=PLUGIN_NAME, dry_run=False):
+    """Remove plugin's copies from dest, and nothing else."""
+    removed = list(plugin_copies(dest, plugin))
+    if not dry_run:
+        for name in removed:
+            shutil.rmtree(os.path.join(dest, name))
+    return {"dest": dest, "removed": removed, "dry_run": dry_run}
+
+
+def installed_skill_dirs(plugin, folders):
+    """[(folder, tool)] for each distinct skills folder that holds copies of plugin, in table order."""
+    seen, found = set(), []
+    for tool, folder in folders.items():
+        if folder in seen:
+            continue
+        seen.add(folder)
+        copies = plugin_copies(folder, plugin)
+        if copies:
+            found.append((folder, next(iter(copies.values())).get("tool") or tool))
+    return found
+
+
+def installed_plugin_roots(plugin, folders):
+    """The plugin roots recorded by plugin's copies in the given skills folders, first seen first."""
+    roots = []
+    for folder in dict.fromkeys(folders.values()):
+        for marker in plugin_copies(folder, plugin).values():
+            if isinstance(marker.get("root"), str) and marker["root"] not in roots:
+                roots.append(marker["root"])
+    return roots
+
+
+def refresh_skills(plugin_root, folders, commit, plugin=PLUGIN_NAME, dry_run=False):
+    """Re-render plugin's copies in every folder that holds some."""
+    return [install_skills(plugin_root, folder, tool, commit, plugin, dry_run)
+            for folder, tool in installed_skill_dirs(plugin, folders)]
+
+
+def plugin_commit(plugin_root):
+    """The commit of the git clone holding plugin_root. Copies must point at a clone: a plugin cache folder moves on
+    every update."""
+    code, out = git(plugin_root, "rev-parse", "HEAD")
+    if code != 0 or not out:
+        raise HerdrError("%s is not in a git clone. Install from a clone of the repository (git clone ...), not from "
+                         "a plugin cache, so the copies keep pointing at a folder that stays put." % plugin_root)
+    return out
+
+
+def pull_plugin(plugin_root):
+    """Fast-forward the clone holding plugin_root; refuses on local changes."""
+    code, porcelain = git(plugin_root, "status", "--porcelain")
+    if code != 0:
+        raise HerdrError("%s is not in a git clone; nothing to pull." % plugin_root)
+    if porcelain:
+        raise HerdrError("The clone at %s has local changes; commit or remove them, or re-render without pulling "
+                         "(install-skills --update --no-pull).\n%s" % (plugin_root, porcelain))
+    proc = subprocess.run(["git", "-C", plugin_root, "pull", "--ff-only"], capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise HerdrError("git pull --ff-only failed in %s:\n%s" % (plugin_root, (proc.stderr or proc.stdout).strip()))
+    return proc.stdout.strip()
+
+
+def install_skills_command(args):
+    """install-skills: install, update or uninstall the rendered copies, printing JSON."""
+    folders = skill_dirs()
+    if args.uninstall:
+        dest = args.dest or folders[args.tool or DEFAULT_SKILLS_TOOL]
+        return uninstall_skills(dest, dry_run=args.dry_run)
+    if args.update:
+        if args.dest:
+            folders = {"dest": args.dest}
+        elif args.tool:
+            folders = {args.tool: folders[args.tool]}
+        pulled = None
+        if not args.no_pull and not args.dry_run:
+            pulled = pull_plugin(PLUGIN_ROOT)
+            # Render with the code just pulled, not the code already loaded.
+            argv = [sys.executable, os.path.abspath(__file__), "install-skills", "--update", "--no-pull"]
+            argv += ["--dest", args.dest] if args.dest else ["--tool", args.tool] if args.tool else []
+            proc = subprocess.run(argv, capture_output=True, text=True)
+            if proc.returncode != 0:
+                raise HerdrError(proc.stderr.strip() or proc.stdout.strip())
+            return {"pulled": pulled, "refreshed": json.loads(proc.stdout)["refreshed"]}
+        refreshed = refresh_skills(PLUGIN_ROOT, folders, plugin_commit(PLUGIN_ROOT), dry_run=args.dry_run)
+        if not refreshed:
+            raise HerdrError("No installed %s skills found in %s; install them first." % (
+                PLUGIN_NAME, ", ".join(dict.fromkeys(folders.values()))))
+        return {"pulled": pulled, "refreshed": refreshed}
+    tool = args.tool or DEFAULT_SKILLS_TOOL
+    return install_skills(PLUGIN_ROOT, args.dest or folders[tool], tool, plugin_commit(PLUGIN_ROOT),
+                          dry_run=args.dry_run)
+
+
 # ---- CLI -----------------------------------------------------------------------------------------------------------
 
 
@@ -1630,8 +1850,23 @@ def main(argv=None):
     sm = sub.add_parser("sync-mirrors")
     sm.add_argument("--path", required=True)
     sm.add_argument("--dry-run", action="store_true")
+    ik = sub.add_parser("install-skills")
+    ik.add_argument("--tool", choices=sorted(SKILL_DIRS), help="install into this tool's own skills folder")
+    ik.add_argument("--dest", help="install into this skills folder instead")
+    ik.add_argument("--dry-run", action="store_true")
+    ik_mode = ik.add_mutually_exclusive_group()
+    ik_mode.add_argument("--update", action="store_true", help="pull the clone, then re-render every installed copy")
+    ik_mode.add_argument("--uninstall", action="store_true")
+    ik.add_argument("--no-pull", action="store_true", help="with --update: re-render without pulling")
     args = parser.parse_args(argv)
 
+    if args.command == "install-skills":  # installs skill copies for other agents; works outside Herdr
+        try:
+            print(json.dumps(install_skills_command(args), indent=2))
+        except HerdrError as error:
+            print(str(error), file=sys.stderr)
+            return 1
+        return 0
     if args.command == "setup-scan":  # reads a repo only, so it also works outside Herdr
         try:
             print(json.dumps(scan_repo(args.path), indent=2))
