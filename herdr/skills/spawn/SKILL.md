@@ -14,7 +14,7 @@ Helper: `sh "${CLAUDE_PLUGIN_ROOT}/scripts/herdr-tools"`, written `herdr_tools.p
   - `tracker.kind == jira`: read the ticket (`acli jira workitem view KEY`).
   - Branch: with `tracker.branch_command`, run it with `{type}` and `{key}` filled in and the ticket title on stdin, and read `.branch` from its JSON. Otherwise a short `<type>/<KEY-or-topic>-<desc>` branch (conventional-commit type, hyphen-case).
 - **Names:** workspace label `<KEY or topic> <two-word topic>` (e.g. `PROJ-105 language`); agent name the key lower-cased without the dash (`proj105`), or a short topic, matching `[a-z][a-z0-9_-]{0,31}`. Check `herdr_tools.py status` so the name is not already taken.
-- **Kind:** `claude` unless the user asks for another.
+- **Kind:** `claude` unless the user asks for another of the kinds `herdr agent` lists (such as `codex`, `gemini`, `opencode` or `omp`). An agent of another kind reads the brief the same way; it needs the herdr skills installed for its tool only if it will run them itself (README, "Other coding agents").
 - **Shared concepts, across a batch:** list the concepts each ticket will define or change (rules, thresholds, mappings, value sets, vocabularies other code must agree with) and find their current owners in the code. Agents in parallel worktrees can't see each other, so a concept touched by two tickets gets one owner ticket. The others reuse its definition, landing after it or rebasing onto it. Say which in each brief.
 
 ## When the repo has its own launcher
@@ -28,7 +28,7 @@ herdr_tools.py repo-launch --path "<repo>" --key <KEY> [--branch <branch>]
 Pass `--branch` only when the launcher's command uses `{branch}`. It runs the launcher from the main checkout and waits for the agent named by `spawn.agent`. Read its JSON:
 
 - A refusal is printed as the launcher said it, for example a ticket that is already claimed or a workspace that is already open. Show it to the user and stop. Never work around it with `launch`, `git worktree add` or `herdr agent start`.
-- `trust_prompt: true`: the agent is at Claude's folder-trust prompt. Tell the user which workspace to open, and never answer it for them.
+- `trust_prompt: true`: the agent is at its folder-trust prompt. Tell the user which workspace to open, and never answer it for them.
 - `brief: true` (the profile's `spawn.brief`): write the brief as in step 3, then send it with `herdr_tools.py send-prompt --name <agent> --prompt "Read the brief at <brief path> …"` once the agent is idle.
 - `brief: false`: send nothing. The launcher gave the agent its task.
 
@@ -51,7 +51,7 @@ herdr_tools.py launch --path <worktree> --label "<label>" --name <agent> \
 
 It opens the worktree as a background workspace (Herdr reuses the repo's parent workspace on its main checkout, or creates one), starts the agent, and sends the prompt. A new workspace's shell can take a few seconds to come up; launch retries `herdr agent start` until it is ready (up to 30s) and otherwise fails with a message naming the command to run by hand. Read its JSON:
 
-- `trust_prompt: true` — the agent is at Claude's folder-trust prompt, and launch saved the prompt instead of sending it. Never answer the trust prompt for the user. Tell them which workspace to open, then run `herdr_tools.py send-prompt --name <agent>` in the background (`run_in_background`): it waits up to 10 minutes for them to answer, sends the saved prompt and confirms the agent is working. If it times out, re-run it once they have answered.
+- `trust_prompt: true` — the agent is at its folder-trust prompt, and launch saved the prompt instead of sending it. Never answer the trust prompt for the user. Tell them which workspace to open, then run `herdr_tools.py send-prompt --name <agent>` in the background (Claude Code: `run_in_background`; elsewhere a background shell job, or a sibling pane with `/herdr:run`, whose output you read when it ends): it waits up to 10 minutes for them to answer, sends the saved prompt and confirms the agent is working. If it times out, re-run it once they have answered.
 - `status: working` (or `idle` with `prompted: true`, a prompt it already finished) — done. `status: blocked` soon after is usually the agent's own question; `/herdr:peek` it.
 
 ## 5. Report

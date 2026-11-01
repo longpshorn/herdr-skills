@@ -17,7 +17,7 @@ Every agent, whether spawned by `/herdr:spawn` or started by hand, works the sam
 - The exception is a shared concept (a rule or set of values other code must agree on). Import it from its owner in `docs/shared-concepts.md`, or give a new one an owner and a registry row from the start. Never re-list its values, not even in a comment.
 
 **Before you hand over**
-- `npm run check` passes. The Stop hook runs it when you finish with changed files and sends you back if it fails.
+- `npm run check` passes. In Claude Code, the Stop hook runs it when you finish with changed files and sends you back if it fails; other coding agents have no such hook here, so run it yourself.
 - `npm run docs:impact` lists the docs your change may have made untrue. Reread each one, and record it in the MR's (or PR's) "Docs reviewed" section as updated or no change needed.
 
 **Hand over**
