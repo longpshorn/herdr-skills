@@ -449,9 +449,10 @@ PRACTICES = [
                  "agents never share a dev server or node_modules.",
      ["scripts/worktree.mjs", "scripts/lib/worktree.mjs", "scripts/lib/worktree.test.mjs", "scripts/bootstrap.mjs",
       "scripts/lib/herdr-plugin.mjs", "scripts/lib/herdr-plugin.test.mjs", ".gitignore"]),
-    ("agent_lifecycle", "Agents follow the repo's CLAUDE.md: test first, never merge, rebase and hand over, run the "
-                        "doc check. Without it each agent improvises its own process.",
-     ["CLAUDE.md"]),
+    ("agent_lifecycle", "Agents follow the repo's AGENTS.md: test first, never merge, rebase and hand over, run the "
+                        "doc check. Without it each agent improvises its own process. One AGENTS.md serves every "
+                        "coding agent; CLAUDE.md only imports it (@AGENTS.md), so there is one file to keep true.",
+     ["AGENTS.md", "CLAUDE.md"]),
     ("stop_hook", "A Stop hook runs the project's checks before an agent may finish, so it can't hand over red work.",
      [".claude/settings.json", ".claude/hooks/verify-on-stop.mjs", "scripts/lib/stop-hook.test.mjs"]),
     ("shared_concepts", "A registry gives each shared rule or value set one owner, and its check fails when another "

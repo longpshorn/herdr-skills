@@ -18,8 +18,8 @@ test('docs that name real scripts and files have no problems', () => {
 });
 
 test('a script the docs name but package.json lacks is reported', () => {
-  assert.deepEqual(checkDocParity(repo({ 'package.json': PACKAGE, 'CLAUDE.md': 'Run `npm run lint` first.\n' })),
-    ['CLAUDE.md: `npm run lint` is not a script in package.json']);
+  assert.deepEqual(checkDocParity(repo({ 'package.json': PACKAGE, 'AGENTS.md': 'Run `npm run lint` first.\n' })),
+    ['AGENTS.md: `npm run lint` is not a script in package.json']);
 });
 
 test('a repo path or relative link that no longer exists is reported', () => {

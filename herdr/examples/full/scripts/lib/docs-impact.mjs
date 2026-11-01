@@ -4,9 +4,11 @@ import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
-const SUMMARY_DOCS = ['README.md', 'CLAUDE.md'];
-const GUIDES = ['README.md', 'CLAUDE.md'];
-const GENERIC_NAMES = new Set(['index.ts', 'index.js', 'index.mjs', 'package.json', 'README.md', 'CLAUDE.md']);
+// AGENTS.md holds the agent rules; CLAUDE.md is a one-line import of it, so it is never a doc to reread.
+const SUMMARY_DOCS = ['README.md', 'AGENTS.md'];
+const GUIDES = ['README.md', 'AGENTS.md'];
+const GENERIC_NAMES = new Set(['index.ts', 'index.js', 'index.mjs', 'package.json', 'README.md', 'AGENTS.md',
+  'CLAUDE.md']);
 const EXPORT = /^[+-]\s*export\s+(?:async\s+)?(?:const|let|var|function\*?|class|type|interface|enum)\s+(\w{3,})/gm;
 
 const codeSpans = (text) => [...text.matchAll(/`([^`]+)`|\]\(([^)]+)\)/g)].map((m) => m[1] ?? m[2]);

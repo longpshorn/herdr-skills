@@ -36,7 +36,7 @@ Then report as in step 5: the workspace, the agent and the launcher's output. Th
 
 ## 2. Create the worktree
 
-Use the profile's `worktree.new` with `{branch}` filled in and its `worktree.env` exported first (values are shell expressions such as a CLI's token; never print a token). With no `worktree.new`, run `git worktree add -b <branch> "../<repo>-<KEY-or-topic>-<slug>" origin/<default branch>` from the repo, then the repo's own setup command (look in its `CLAUDE.md`, README, `package.json` scripts or `Makefile`). Confirm the branch is checked out there before going on.
+Use the profile's `worktree.new` with `{branch}` filled in and its `worktree.env` exported first (values are shell expressions such as a CLI's token; never print a token). With no `worktree.new`, run `git worktree add -b <branch> "../<repo>-<KEY-or-topic>-<slug>" origin/<default branch>` from the repo, then the repo's own setup command (look in its `AGENTS.md` or `CLAUDE.md`, README, `package.json` scripts or `Makefile`). Confirm the branch is checked out there before going on.
 
 ## 3. Write the brief
 

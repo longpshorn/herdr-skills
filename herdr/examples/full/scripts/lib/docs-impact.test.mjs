@@ -8,7 +8,7 @@ import { docsImpact, formatImpact, impactInputs } from './docs-impact.mjs';
 
 const DOCS = {
   'README.md': '# acme\n',
-  'CLAUDE.md': '# rules\n',
+  'AGENTS.md': '# rules\n',
   'src/billing/README.md': 'Billing.\n',
   'docs/cache.md': 'Entries expire after `isFresh` says so. See `src/cache.ts`.\n',
   'docs/other.md': 'Nothing relevant; a cache is mentioned in prose only.\n',
@@ -18,7 +18,7 @@ const reasonsFor = (impact, doc) => impact.find((item) => item.doc === doc)?.rea
 
 test('the summary docs are always listed, first', () => {
   const impact = docsImpact({ changed: ['src/x.ts'], diff: '', docs: DOCS });
-  assert.deepEqual(impact.slice(0, 2).map((item) => item.doc), ['README.md', 'CLAUDE.md']);
+  assert.deepEqual(impact.slice(0, 2).map((item) => item.doc), ['README.md', 'AGENTS.md']);
 });
 
 test('the nearest guide above a changed file is listed', () => {

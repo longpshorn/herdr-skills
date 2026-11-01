@@ -1209,7 +1209,8 @@ class SetupScan(unittest.TestCase):
 
     def test_spots_the_practices_a_repo_already_has(self):
         practices = self.practices(self.scan({
-            "CLAUDE.md": "# App\n\n## Development lifecycle (agents)\nNever merge.\n",
+            "AGENTS.md": "# App\n\n## Development lifecycle (agents)\nNever merge.\n",
+            "CLAUDE.md": "@AGENTS.md\n",
             ".claude/settings.json": {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "x"}]}]}},
             "docs/shared-concepts.md": "## Registry\n",
             "package.json": {"scripts": {"docs:impact": "node scripts/docs-impact.mjs"}},
@@ -1217,6 +1218,10 @@ class SetupScan(unittest.TestCase):
             "scripts/bootstrap.mjs": "install('herdr@herdr-skills')",
         }))
         self.assertEqual([name for name, p in practices.items() if not p["present"]], ["worktree"])
+
+    def test_a_lifecycle_still_kept_in_claude_md_counts(self):
+        practices = self.practices(self.scan({"CLAUDE.md": "# App\n\n## Development lifecycle (agents)\nNever merge.\n"}))
+        self.assertTrue(practices["agent_lifecycle"]["present"])
 
     def test_flags_the_plugin_in_the_projects_committed_settings(self):
         result = self.scan({".claude/settings.json": {"enabledPlugins": {"herdr@herdr-skills": True}}})
