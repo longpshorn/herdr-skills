@@ -2290,7 +2290,7 @@ class InstallSkillsCommand(unittest.TestCase):
         code, out, err = self.run_main("install-skills", "--dest", self.dest)
         self.assertEqual(code, 0, err)
         self.assertIn("herdr-spawn", os.listdir(self.dest))
-        self.assertIn(self.dest, out)
+        self.assertEqual(json.loads(out)["dest"], self.dest)
 
     def test_refuses_a_root_outside_a_git_checkout(self):
         copy = os.path.join(self.tmp, "cache", "herdr")
