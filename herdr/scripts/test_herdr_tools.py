@@ -14,6 +14,38 @@ import unittest
 import herdr_tools as ht
 
 REPO = "/code/repo"
+# HOME, and USERPROFILE, which is what expanduser reads on Windows.
+HOME_VARS = ("HOME", "USERPROFILE")
+SUITE_HOME = None
+
+
+def point_home_at(path):
+    """Point the home directory at path; returns what restore_home needs to undo it."""
+    saved = {name: os.environ.get(name) for name in HOME_VARS}
+    for name in HOME_VARS:
+        os.environ[name] = path
+    return saved
+
+
+def restore_home(saved):
+    for name, value in saved.items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
+
+
+def setUpModule():
+    """No test reads the real home folder (installed plugins, settings, status reports): the suite runs against an
+    empty one."""
+    global SUITE_HOME, SAVED_HOME
+    SUITE_HOME = tempfile.mkdtemp()
+    SAVED_HOME = point_home_at(SUITE_HOME)
+
+
+def tearDownModule():
+    restore_home(SAVED_HOME)
+    shutil.rmtree(SUITE_HOME)
 WORKSPACES = [
     {"workspace_id": "w1", "label": "notes", "number": 1},
     {
@@ -182,25 +214,18 @@ class FakeAgentHerdr:
 
 
 class AgentHerdrTest(unittest.TestCase):
-    """Stubs `herdr` and git, and points the home directory at a temporary one for the saved-prompt files (HOME, and
-    USERPROFILE, which is what expanduser reads on Windows)."""
-
-    HOME_VARS = ("HOME", "USERPROFILE")
+    """Stubs `herdr` and git, and points the home directory at a temporary one of its own for the saved-prompt
+    files."""
 
     def setUp(self):
-        self.saved = ht.herdr, ht.repo_root, {name: os.environ.get(name) for name in self.HOME_VARS}
+        self.saved = ht.herdr, ht.repo_root
         ht.repo_root = lambda path: REPO
         self.home = tempfile.mkdtemp()
-        for name in self.HOME_VARS:
-            os.environ[name] = self.home
+        self.saved_home = point_home_at(self.home)
 
     def tearDown(self):
-        ht.herdr, ht.repo_root, env = self.saved
-        for name, value in env.items():
-            if value is None:
-                os.environ.pop(name, None)
-            else:
-                os.environ[name] = value
+        ht.herdr, ht.repo_root = self.saved
+        restore_home(self.saved_home)
         shutil.rmtree(self.home)
 
     def use(self, fake):
@@ -2055,3 +2080,7 @@ class WorkToolsPath(unittest.TestCase):
             self.write_json(os.path.join(self.plugins, "known_marketplaces.json"), known)
             self.assertIsNone(ht.work_tools_path(self.plugins), (installed, known))
 
+
+    def test_the_default_reads_the_suites_empty_home_not_the_real_one(self):
+        self.assertEqual(os.path.expanduser("~"), SUITE_HOME)
+        self.assertIsNone(ht.work_tools_path())
