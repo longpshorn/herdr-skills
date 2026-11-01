@@ -1283,6 +1283,20 @@ class Shareable(unittest.TestCase):
                         offenders.append("%s: %s" % (os.path.relpath(os.path.join(folder, name), plugin), needle))
         self.assertEqual(offenders, [])
 
+    def test_commands_in_the_docs_quote_their_paths(self):
+        plugin = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        path_argument = re.compile(r'(?:--cwd|--path|-C|worktree remove|worktree add -b \S+) (?!")\S*<')
+        offenders = []
+        for folder, _, files in os.walk(plugin):
+            for name in (n for n in files if n.endswith(".md")):
+                with open(os.path.join(folder, name), encoding="utf-8") as handle:
+                    for number, line in enumerate(handle, 1):
+                        for command in re.findall(r"`([^`]+)`", line):
+                            if path_argument.search(command):
+                                offenders.append("%s:%d: %s" % (
+                                    os.path.relpath(os.path.join(folder, name), plugin), number, command))
+        self.assertEqual(offenders, [])
+
     def test_the_default_plan_gate_names_no_one(self):
         self.assertNotIn("Patrick", ht.resolve_profile(None, "")["brief"]["implement"])
 

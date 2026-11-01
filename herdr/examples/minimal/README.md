@@ -17,4 +17,4 @@ Move to the [full example](../full/README.md) when several agents work in parall
 - `planning`: your own planning page, where `/herdr:retire` adds captured follow-ups. Teammates have their own, or none.
 - `mirrors`: your copies of repo docs kept outside the repo (notes, a wiki), refreshed after each merge. They are paths on your machine.
 
-Committed to the repo, either would point every teammate's retire at your page and your home folder. Copy the file to `~/.config/herdr/profiles/acme-app.json`, change `match` and the paths, and check the result with the helper's `profile --path <repo>` command.
+Committed to the repo, either would point every teammate's retire at your page and your home folder. Copy the file to `~/.config/herdr/profiles/acme-app.json`, change `match` and the paths, and check the result with the helper's `profile --path "<repo>"` command.

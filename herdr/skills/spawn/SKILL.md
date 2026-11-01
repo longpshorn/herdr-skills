@@ -9,7 +9,7 @@ Helper: `sh "${CLAUDE_PLUGIN_ROOT}/scripts/herdr-tools"`, written `herdr_tools.p
 
 ## 1. Settle the inputs
 
-- **Repo and profile:** the current repo unless the user names another. Run `herdr_tools.py profile --path <repo>` and use its fields below (`forge`, `tracker`, `worktree`, `brief`). A repo without a profile resolves to working defaults; [PROFILES.md](${CLAUDE_PLUGIN_ROOT}/PROFILES.md) explains the fields.
+- **Repo and profile:** the current repo unless the user names another. Run `herdr_tools.py profile --path "<repo>"` and use its fields below (`forge`, `tracker`, `worktree`, `brief`). A repo without a profile resolves to working defaults; [PROFILES.md](${CLAUDE_PLUGIN_ROOT}/PROFILES.md) explains the fields.
 - **Ticket and branch:**
   - `tracker.kind == jira`: read the ticket (`acli jira workitem view KEY`).
   - Branch: with `tracker.branch_command`, run it with `{type}` and `{key}` filled in and the ticket title on stdin, and read `.branch` from its JSON. Otherwise a short `<type>/<KEY-or-topic>-<desc>` branch (conventional-commit type, hyphen-case).
@@ -22,7 +22,7 @@ Helper: `sh "${CLAUDE_PLUGIN_ROOT}/scripts/herdr-tools"`, written `herdr_tools.p
 If the profile sets `spawn.command`, the repository starts work its own way: its launcher creates the worktree, opens the workspace, starts the agent and may claim the ticket itself. Skip steps 2–4 and run:
 
 ```bash
-herdr_tools.py repo-launch --path <repo> --key <KEY> [--branch <branch>]
+herdr_tools.py repo-launch --path "<repo>" --key <KEY> [--branch <branch>]
 ```
 
 Pass `--branch` only when the launcher's command uses `{branch}`. It runs the launcher from the main checkout and waits for the agent named by `spawn.agent`. Read its JSON:
@@ -36,7 +36,7 @@ Then report as in step 5: the workspace, the agent and the launcher's output. Th
 
 ## 2. Create the worktree
 
-Use the profile's `worktree.new` with `{branch}` filled in and its `worktree.env` exported first (values are shell expressions such as a CLI's token; never print a token). With no `worktree.new`, run `git worktree add -b <branch> ../<repo>-<KEY-or-topic>-<slug> origin/<default branch>` from the repo, then the repo's own setup command (look in its `CLAUDE.md`, README, `package.json` scripts or `Makefile`). Confirm the branch is checked out there before going on.
+Use the profile's `worktree.new` with `{branch}` filled in and its `worktree.env` exported first (values are shell expressions such as a CLI's token; never print a token). With no `worktree.new`, run `git worktree add -b <branch> "../<repo>-<KEY-or-topic>-<slug>" origin/<default branch>` from the repo, then the repo's own setup command (look in its `CLAUDE.md`, README, `package.json` scripts or `Makefile`). Confirm the branch is checked out there before going on.
 
 ## 3. Write the brief
 
