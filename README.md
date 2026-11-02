@@ -2,14 +2,14 @@
 
 [![AgentAvow](https://agentavow.com/api/v1/public/scan/longpshorn/herdr-skills/badge)](https://agentavow.com/check/longpshorn/herdr-skills)
 
-Claude Code skills for running coding agents in [Herdr](https://herdr.dev), a terminal workspace manager for AI coding agents. The workflow is **one ticket, one worktree, one agent**: you hand a ticket to a new agent in its own git worktree, from a written brief. It plans, stops for your approval, builds test-first and opens an MR. When the MR is approved and green, `/herdr:retire` lands it, cleans up and captures the follow-ups. You stay in one orchestrating session and see every agent from it.
+Skills for running coding agents in [Herdr](https://herdr.dev), a terminal workspace manager for AI coding agents. The workflow is **one ticket, one worktree, one agent**: you hand a ticket to a new agent in its own git worktree, from a written brief. It plans, stops for your approval, builds test-first and opens an MR. When the MR is approved and green, `/herdr:retire` lands it, cleans up and captures the follow-ups. You stay in one orchestrating session and see every agent from it.
 
-This repository is a Claude Code plugin marketplace (`herdr-skills`) with one plugin, `herdr`, whose skills are `/herdr:setup`, `/herdr:status`, `/herdr:spawn`, `/herdr:ask`, `/herdr:peek`, `/herdr:run` and `/herdr:retire`.
+This repository is a Claude Code plugin marketplace (`herdr-skills`) with one plugin, `herdr`, whose skills are `/herdr:setup`, `/herdr:status`, `/herdr:spawn`, `/herdr:ask`, `/herdr:peek`, `/herdr:run` and `/herdr:retire`. The same skills run in Codex, Gemini CLI, OpenCode and omp: see [Other coding agents](#other-coding-agents).
 
 ## Requirements
 
 - macOS. The skills have only been used on macOS so far; their helper and the examples are tested on Linux, macOS and Windows.
-- [Herdr](https://herdr.dev) (`brew install herdr`), [Claude Code](https://claude.com/claude-code), `git`, and Python 3.9 or later as `python3`, `python` or `py -3` (the macOS Command Line Tools one is enough). The skills run the helper through `herdr/scripts/herdr-tools`, which picks the first that works.
+- [Herdr](https://herdr.dev) (`brew install herdr`), [Claude Code](https://claude.com/claude-code) or [another coding agent](#other-coding-agents), `git`, and Python 3.9 or later as `python3`, `python` or `py -3` (the macOS Command Line Tools one is enough). The skills run the helper through `herdr/scripts/herdr-tools`, which picks the first that works.
 - The CLI for your forge: `glab` (GitLab) or `gh` (GitHub), signed in. For Jira tickets, `acli`, signed in.
 
 ## Install
@@ -25,6 +25,36 @@ claude plugin install herdr@herdr-skills --scope user
 **For a project's team**, have the project's setup script run those commands for each developer, only when they are missing. Treat an existing `herdr-skills` marketplace (such as a local clone someone edits) or an installed `herdr@herdr-skills` as present, and leave it alone. Keep the plugin out of the project's committed `.claude/settings.json`: it is each developer's tool, not a project dependency. What the project shares goes in its profile (below).
 
 The plugin has no pinned version, so every commit here is a new version. Run `claude plugin update herdr@herdr-skills` to take it, or turn on auto-update for the `herdr-skills` marketplace in `/plugin` → Marketplaces.
+
+## Other coding agents
+
+Claude Code installs the skills as a plugin (above), and that stays the main way in. Other coding agents read plain skill folders: Codex, Gemini CLI, OpenCode and omp all read `~/.agents/skills`. `install-skills` writes a copy of each skill there.
+
+```bash
+git clone https://github.com/longpshorn/herdr-skills ~/code/herdr-skills   # any folder that stays put
+sh ~/code/herdr-skills/herdr/scripts/herdr-tools install-skills             # into ~/.agents/skills: all four tools
+sh ~/code/herdr-skills/herdr/scripts/herdr-tools install-skills --update    # later: pull the clone, refresh the copies
+```
+
+- **What it writes.** One folder per skill, named `herdr-<skill>` (`herdr-status`, `herdr-spawn`, ...), so generic names such as `status` and `run` can't collide with another package's skills. In each copy `${CLAUDE_PLUGIN_ROOT}`, which only Claude Code fills in, is replaced by the clone's absolute `herdr` folder (forward slashes on Windows too), so every skill finds its helper, examples and references. A note under the heading says that `/herdr:<name>` in the text means the `herdr-<name>` skill.
+- **Where.** `--tool` picks a tool's own folder instead of the shared one, and `--dest` any folder. Run it once per tool you want, or once for all four with the default.
+
+  | `--tool` | Folder | Source |
+  | - | - | - |
+  | `agents` (default), `codex` | `~/.agents/skills` | [Codex skills](https://learn.chatgpt.com/docs/build-skills) (`~/.codex/skills` is deprecated); also read by Gemini CLI, OpenCode and omp |
+  | `gemini` | `~/.gemini/skills` | [Gemini CLI skills](https://geminicli.com/docs/cli/skills/) |
+  | `opencode` | `$XDG_CONFIG_HOME/opencode/skills` (default `~/.config/opencode/skills`) | [OpenCode skills](https://opencode.ai/docs/skills/) |
+  | `omp` | `~/.omp/agent/skills` | [omp skills](https://github.com/can1357/oh-my-pi/blob/main/docs/skills.md) |
+
+- **Safe to re-run.** Each copy holds a `.skills-install.json` marker (plugin, skill, clone, tool, commit). Only folders with herdr's marker are ever replaced or removed; a `herdr-*` folder without one stops the install before anything is written. `--dry-run` shows what would change. `--update` refuses a clone with local changes (`--no-pull` re-renders without pulling). `--uninstall` removes the copies. A copy made with `--dest` is updated and removed with the same `--dest`.
+- **Install from a clone.** It refuses a folder outside a git clone, such as Claude Code's plugin cache, because that folder moves on every update and the copies would point at nothing.
+- **Never edits another tool's settings.** When a tool needs one, it prints it. Gemini CLI reads `GEMINI.md`, not `AGENTS.md`, unless `~/.gemini/settings.json` has `"context": {"fileName": ["AGENTS.md", "GEMINI.md"]}`. Codex, OpenCode and omp read `AGENTS.md` as they are.
+- **Agents of other kinds.** `/herdr:spawn` starts any kind `herdr agent` lists (`codex`, `gemini`, `opencode`, `omp`, ...). A spawned agent reads its brief as text; it needs the copies only to run the skills itself.
+- **Claude Code-only parts.** Where a skill names a Claude Code tool (`run_in_background`), the same line says what to do elsewhere. Hooks have no common equivalent: the full example's Stop hook runs only in Claude Code, and its `AGENTS.md` tells every agent to run the check itself, so nothing depends on it. The herdr plugin itself ships no hooks.
+
+Codex and omp can also add this repository as a Claude Code-style marketplace (`codex plugin marketplace add`, `omp plugin marketplace add`). That route is untested; `install-skills` is the supported one.
+
+**For sibling plugins** (work-skills, adlc-skills): copy this mechanism as it is. The plugin's helper owns it (`render_skill`, `install_skills`, `SKILL_DIRS` and `SKILLS_MARKER` in `herdr/scripts/herdr_tools.py`), run as `sh <plugin>/scripts/<plugin>-tools install-skills` with the same flags. Copies are named `<plugin>-<skill>`, and the marker's `plugin` field is the plugin's name. `/herdr:retire` finds the work plugin's launcher from a work copy's marker when the Claude Code plugin isn't installed.
 
 ## Getting started
 

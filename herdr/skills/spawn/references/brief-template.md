@@ -39,9 +39,9 @@ Before you define any rule, threshold, mapping or list of values, search for an 
 ## Process
 
 1. <The profile's `brief.implement`, with `{key}` filled in. Whatever it says, planning is a hard stop: present the plan and wait for the owner's approval in this pane.>
-2. Commits are `<type>: <KEY> <desc>`, small and logical, ending with the Co-Authored-By line from your attribution instructions.
+2. Commits are `<type>: <KEY> <desc>`, small and logical, ending with the attribution lines your tool's instructions give, if any (Claude Code: the Co-Authored-By line).
 3. Done means: <the repo's full check and test commands> are clean; docs are updated (<the ones in scope>); the branch is rebased on `origin/<default branch>`.
-4. Push and open the MR/PR with <the profile's `brief.mr_create`> targeting `<default branch>`, titled `<type>: <KEY> <summary>`, describing what was built and its verification (each item Verified or Unverified), ending with `🤖 Generated with [Claude Code](https://claude.com/claude-code)`. Don't post to Slack. Never merge it: the owner lands it with `/herdr:retire` after validating.
+4. Push and open the MR/PR with <the profile's `brief.mr_create`> targeting `<default branch>`, titled `<type>: <KEY> <summary>`, describing what was built and its verification (each item Verified or Unverified), ending with the attribution line your tool's instructions give, if any (Claude Code: `🤖 Generated with [Claude Code](https://claude.com/claude-code)`). Don't post to Slack. Never merge it: the owner lands it with `/herdr:retire` after validating.
 5. Wait for the MR pipeline and report the job results. If a job fails, fix the root cause.
 6. Every push runs the whole pipeline and costs compute, so push only what is ready to be checked: run the step 3 checks locally first, and don't push work in progress. When answering review, fix every open thread and push once for the round, not once per thread.
 
