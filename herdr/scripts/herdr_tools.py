@@ -19,6 +19,8 @@
       and the agent is idle, then send the prompt launch saved (or the one given) and confirm the agent started working.
   herdr_tools.py report-path --name AGENT
       Create the status-report directory and print the file AGENT keeps its status report in.
+  herdr_tools.py brief-path --name AGENT
+      Create the briefs directory and print the file spawn writes AGENT's brief to.
   herdr_tools.py retire-info AGENT|WORKSPACE_ID|LABEL
       JSON for /herdr:retire: workspace, worktree, main checkout, branch, MR (the worktree branch's, else the one the
       agent's status report names, in any repo), the agent's parsed status report, and every retire check.
@@ -131,6 +133,11 @@ def repo_root_from_common_dir(common_dir):
 def status_report_path(agent, home=None):
     """Where a spawned agent keeps its status report: outside the worktree, so it survives removal and stays out of git."""
     return os.path.join(home or os.path.expanduser("~"), ".cache", "herdr", "status", agent + ".md")
+
+
+def brief_path(agent, home=None):
+    """Where spawn writes an agent's brief: beside its status report, so a restart that clears a scratchpad keeps it."""
+    return os.path.join(home or os.path.expanduser("~"), ".cache", "herdr", "briefs", agent + ".md")
 
 
 def parse_status_report(text):
@@ -1605,6 +1612,8 @@ def main(argv=None):
     sp_group.add_argument("--prompt-file")
     rp = sub.add_parser("report-path")
     rp.add_argument("--name", required=True)
+    bp = sub.add_parser("brief-path")
+    bp.add_argument("--name", required=True)
     ri = sub.add_parser("retire-info")
     ri.add_argument("target")
     la = sub.add_parser("land")
@@ -1660,6 +1669,10 @@ def main(argv=None):
             print(json.dumps(send_prompt(args.name, prompt, args.timeout_seconds), indent=2))
         elif args.command == "report-path":
             path = status_report_path(args.name)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            print(path)
+        elif args.command == "brief-path":
+            path = brief_path(args.name)
             os.makedirs(os.path.dirname(path), exist_ok=True)
             print(path)
         elif args.command == "retire-info":

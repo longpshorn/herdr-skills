@@ -32,7 +32,7 @@ Helper: `sh "${CLAUDE_PLUGIN_ROOT}/scripts/herdr-tools"`, written `herdr_tools.p
      - The profile has `mirrors`: run `herdr_tools.py sync-mirrors --path "<main checkout>"`. Report each `synced` copy with its backup, and each `problem` (a missing file or marker line): it was left as it was, so tell the user.
      - `facts_changed` lists files: the merge changed something the planning page restates (`planning.facts` says which sections). Refresh those sections from the main checkout, taking test counts from the default branch's latest pipeline, not memory. Then check, publish and verify as in step 8's **Capture**.
    - Run `/work:checkpoint` for the matched workstream with the confirmed Log line and `next`; the user already approved them, so don't ask again.
-   - Leave the status report file; the next agent with that name overwrites it.
+   - Leave the status report and brief files; the next agent with that name overwrites them.
 8. **Capture follow-ups** so no valid task is lost. `retire-info` lists them in `followups`: each Follow-ups bullet and each change the agent marked Unverified. When retiring several agents, triage them together.
    - **Check each is valid:** still true on the default branch now (another merge may have fixed it; look at the code), not already ticketed (search the tracker), and real work rather than a note. Drop the rest, saying why. Fold device or environment checks that wait on the same blocker into one item.
    - **Duplicated concepts:** whatever its report says, check whether the merged work introduced a rule, threshold, mapping or value set that is also defined elsewhere (search for its values and names). A duplicate is a fast follow that names one owner.
