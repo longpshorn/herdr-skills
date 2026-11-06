@@ -560,6 +560,12 @@ class StatusReportPath(unittest.TestCase):
                          os.path.join("/home/p", ".cache", "herdr", "status", "res1.md"))
 
 
+class BriefPath(unittest.TestCase):
+    def test_lives_in_the_herdr_briefs_cache_named_after_the_agent(self):
+        self.assertEqual(ht.brief_path("res1", home="/home/p"),
+                         os.path.join("/home/p", ".cache", "herdr", "briefs", "res1.md"))
+
+
 class ParseStatusReport(unittest.TestCase):
     def test_reads_the_header_fields_and_sections(self):
         report = ht.parse_status_report(REPORT)
