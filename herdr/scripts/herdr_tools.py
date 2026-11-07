@@ -17,6 +17,14 @@
   herdr_tools.py send-prompt --name AGENT [--prompt TEXT | --prompt-file FILE] [--timeout-seconds 600]
       Finish a launch that stopped at the folder-trust prompt: wait until the person running the session answers it
       and the agent is idle, then send the prompt launch saved (or the one given) and confirm the agent started working.
+  herdr_tools.py deliver --name AGENT (--text TEXT | --file FILE) --topic TOPIC [--from SENDER] [--timeout-seconds 300]
+      Send a message as a file plus one pointer line: write it to ~/.cache/herdr/messages/AGENT/, send "Message from
+      SENDER: read PATH (sha256 ...) and act on it.", then check the agent's transcript (Claude agents) that the line
+      arrived intact, the file was read and is unchanged. A pointer that never arrived is resent once, only to an idle
+      agent. Prints JSON; "verified" is yes, no or unverified (other agent kinds). Exits 1 when it is no.
+  herdr_tools.py wait --name AGENT --until STATES [--timeout-seconds 600]
+      Wait until the agent reaches one of the comma-separated STATES. A blank, missing or unknown status means keep
+      waiting. Exits 0 on a match, 2 on timeout, 3 when the agent is gone.
   herdr_tools.py report-path --name AGENT
       Create the status-report directory and print the file AGENT keeps its status report in.
   herdr_tools.py brief-path --name AGENT
@@ -1266,6 +1274,11 @@ REBASE_REQUEST = (
 )
 
 
+def ask_to_rebase(agent, message):
+    """The one message land and watch send an agent, as a file plus pointer like any other."""
+    return deliver(agent, text=message, topic="rebase request", timeout_seconds=120)
+
+
 def watch_loop(agents, land_fn, ask_fn, report_fn, max_seconds, poll_seconds=120, sleep=time.sleep, now=time.time):
     """Land the first agent whose report says it is ready, then return. A conflicting MR's agent is asked once to
     rebase; any other refusal (a running pipeline, a missing approval) is retried on the next poll."""
@@ -1295,7 +1308,7 @@ def refuse_repo_land_all(agents):
 def watch(agents, max_hours=4.0, poll_seconds=120):
     refuse_repo_land_all(agents)
     return watch_loop(
-        agents, land, lambda agent, message: herdr("agent", "prompt", agent, message, parse=False),
+        agents, land, ask_to_rebase,
         lambda agent: read_report(agent)[1], max_hours * 3600, poll_seconds)
 
 
@@ -1340,7 +1353,7 @@ def land_several(agents, timeout_minutes=30, max_hours=3.0, poll_seconds=300):
     refuse_repo_land_all(agents)
     return land_queue(
         agents, lambda agent: land(agent, timeout_minutes),
-        lambda agent, message: herdr("agent", "prompt", agent, message, parse=False), max_hours * 3600, poll_seconds)
+        ask_to_rebase, max_hours * 3600, poll_seconds)
 
 
 def update_main(path):
@@ -1592,6 +1605,181 @@ def repo_launch(main_checkout, profile, values, runner=subprocess.run, sleep=tim
             "brief": spawn["brief"], "trust_prompt": has_trust_prompt(screen)}
 
 
+# ---- Messages between agents: a file plus one pointer line, verified in the receiver's transcript ----------------
+# A long prompt typed into a pane can arrive cut short, so every substantive message is written to a file and the
+# receiver gets one fixed line naming it. For Claude agents the transcript then shows whether that line arrived intact
+# and whether the file was read; other kinds can't be checked.
+
+
+def message_path(agent, topic, now, home=None):
+    """A new file for a message to AGENT: ~/.cache/herdr/messages/<agent>/<YYYYMMDD-HHMMSS>-<topic>.md, never one that
+    already exists. Creates the folder."""
+    folder = os.path.join(home or os.path.expanduser("~"), ".cache", "herdr", "messages", agent)
+    os.makedirs(folder, exist_ok=True)
+    slug = re.sub(r"[^a-z0-9]+", "-", topic.lower()).strip("-")[:40].strip("-") or "message"
+    base = "%s-%s" % (now.strftime("%Y%m%d-%H%M%S"), slug)
+    path, n = os.path.join(folder, base + ".md"), 1
+    while os.path.exists(path):
+        n += 1
+        path = os.path.join(folder, "%s-%d.md" % (base, n))
+    return path
+
+
+def pointer_line(sender, path, sha256):
+    return "Message from %s: read %s (sha256 %s) and act on it." % (sender, path, sha256[:12])
+
+
+def find_transcript(session_id, home=None):
+    """The Claude Code transcript for SESSION_ID, in whichever project folder Claude filed it."""
+    import glob
+    pattern = os.path.join(home or os.path.expanduser("~"), ".claude", "projects", "*", glob.escape(session_id) + ".jsonl")
+    found = glob.glob(pattern)
+    return found[0] if found else None
+
+
+def transcript_entries(path):
+    entries = []
+    with open(path, encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(entry, dict):
+                entries.append(entry)
+    return entries
+
+
+def prompt_text(entry):
+    """The text of a prompt the agent received, or None for anything else (tool results, metadata)."""
+    if entry.get("type") != "user" or entry.get("isMeta"):
+        return None
+    content = (entry.get("message") or {}).get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list) and content and all(isinstance(b, dict) and b.get("type") == "text" for b in content):
+        return "".join(b.get("text", "") for b in content)
+    return None
+
+
+def reads_path(entry, path):
+    if entry.get("type") != "assistant":
+        return False
+    for block in (entry.get("message") or {}).get("content") or []:
+        if isinstance(block, dict) and block.get("type") == "tool_use":
+            if any(path in str(value) for value in (block.get("input") or {}).values()):
+                return True
+    return False
+
+
+def delivery_state(entries, pointer, path):
+    """Whether POINTER arrived intact as a prompt, and whether a later tool call read PATH."""
+    delivered_at, newest = None, None
+    for index, entry in enumerate(entries):
+        text = prompt_text(entry)
+        if text is None:
+            continue
+        newest = text
+        if text.strip() == pointer:
+            delivered_at = index
+    read = delivered_at is not None and any(reads_path(e, path) for e in entries[delivered_at + 1:])
+    return {"delivered": delivered_at is not None, "read": read, "newest_prompt": newest}
+
+
+def file_sha256(path):
+    import hashlib
+    with open(path, "rb") as handle:
+        return hashlib.sha256(handle.read()).hexdigest()
+
+
+def current_sender():
+    """This pane's agent name, else its pane id, for the pointer's 'Message from' part."""
+    pane = herdr("pane", "current")["result"]["pane"]["pane_id"]
+    agent = next((a for a in herdr("agent", "list")["result"]["agents"] if a.get("pane_id") == pane), {})
+    return agent.get("name") or pane
+
+
+def agent_info(target):
+    return herdr("agent", "get", target)["result"]["agent"]
+
+
+def deliver(name, text=None, file=None, topic="message", sender=None, now=None, timeout_seconds=300, poll_seconds=3,
+            resend_after_seconds=30, sleep=time.sleep):
+    """Write the message to a file, send the agent one pointer line naming it, and verify (Claude agents) that the line
+    arrived intact, that the file was read, and that it is unchanged. A pointer that never arrived is resent once, and
+    only to an idle agent: a working agent queues it, and a second copy would make it act twice."""
+    import datetime
+    if (text is None) == (file is None):
+        raise HerdrError("deliver needs exactly one of --text or --file.")
+    if file is not None:
+        with open(file, encoding="utf-8") as handle:
+            text = handle.read()
+    path = message_path(name, topic, now or datetime.datetime.now())
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(text)
+    digest = file_sha256(path)
+    pointer = pointer_line(sender or current_sender(), path, digest)
+    info = agent_info(name)
+    herdr("agent", "prompt", name, pointer)
+    result = {"agent": name, "path": path, "sha256": digest, "pointer": pointer, "attempts": 1,
+              "delivered": None, "read": None}
+    session = (info.get("agent_session") or {}).get("value")
+    if info.get("agent") != "claude" or not session:
+        result.update(verified="unverified", detail="Only Claude agents' transcripts can be checked; sent unverified.")
+        return result
+    state, waited = {"delivered": False, "read": False, "newest_prompt": None}, 0
+    while True:
+        transcript = find_transcript(session)
+        if transcript:
+            state = delivery_state(transcript_entries(transcript), pointer, path)
+        if state["delivered"] and state["read"]:
+            break
+        if waited >= timeout_seconds:
+            break
+        status = agent_info(name).get("agent_status")
+        if not state["delivered"] and result["attempts"] == 1 and waited >= resend_after_seconds and status == "idle":
+            herdr("agent", "prompt", name, pointer)
+            result["attempts"] = 2
+        sleep(poll_seconds)
+        waited += poll_seconds
+    result.update(delivered=state["delivered"], read=state["read"])
+    if file_sha256(path) != digest:
+        result.update(verified="no", detail="The message file changed after it was sent: %s." % path)
+    elif not state["delivered"]:
+        result.update(verified="no", detail="The pointer never arrived intact within %gs (newest prompt: %r)."
+                      % (timeout_seconds, (state["newest_prompt"] or "")[:200]))
+    elif not state["read"]:
+        result.update(verified="no", detail="The pointer arrived but the file was not read within %gs; not resent."
+                      % timeout_seconds)
+    else:
+        result.update(verified="yes", detail="Delivered intact and read.")
+    return result
+
+
+def wait_for(name, until, timeout_seconds=600, poll_seconds=3, gone_seconds=30, sleep=time.sleep):
+    """Wait until the agent reaches one of UNTIL. A blank, missing or unknown status means "keep waiting", never a
+    change; an agent missing for longer than GONE_SECONDS is reported gone."""
+    waited, missing, last = 0, 0, None
+    while True:
+        try:
+            status = (agent_info(name).get("agent_status") or "").strip()
+            missing = 0
+        except HerdrError as error:
+            if "agent_not_found" not in str(error):
+                raise
+            status, missing = "", missing + poll_seconds
+            if missing > gone_seconds:
+                return {"agent": name, "state": "gone", "last": last, "waited": waited}
+        if status and status != "unknown":
+            last = status
+            if status in until:
+                return {"agent": name, "state": status, "waited": waited}
+        if waited >= timeout_seconds:
+            return {"agent": name, "state": "timeout", "last": last, "waited": waited}
+        sleep(poll_seconds)
+        waited += poll_seconds
+
+
 # ---- Skills for other coding agents ---------------------------------------------------------------------------------
 # Claude Code installs the plugin and substitutes ${CLAUDE_PLUGIN_ROOT} in skill text. Other agents (Codex, Gemini CLI,
 # OpenCode, omp) read plain skill folders and set no such variable, so install-skills writes rendered copies: the
@@ -1831,6 +2019,18 @@ def main(argv=None):
     sp_group = sp.add_mutually_exclusive_group()
     sp_group.add_argument("--prompt")
     sp_group.add_argument("--prompt-file")
+    dv = sub.add_parser("deliver")
+    dv.add_argument("--name", required=True)
+    dv_group = dv.add_mutually_exclusive_group(required=True)
+    dv_group.add_argument("--text")
+    dv_group.add_argument("--file")
+    dv.add_argument("--topic", required=True)
+    dv.add_argument("--from", dest="sender")
+    dv.add_argument("--timeout-seconds", type=float, default=300)
+    wt = sub.add_parser("wait")
+    wt.add_argument("--name", required=True)
+    wt.add_argument("--until", required=True, help="comma-separated states: idle, working, blocked, done")
+    wt.add_argument("--timeout-seconds", type=float, default=600)
     rp = sub.add_parser("report-path")
     rp.add_argument("--name", required=True)
     bp = sub.add_parser("brief-path")
@@ -1903,6 +2103,16 @@ def main(argv=None):
         elif args.command == "send-prompt":
             prompt = open(args.prompt_file).read().strip() if args.prompt_file else args.prompt
             print(json.dumps(send_prompt(args.name, prompt, args.timeout_seconds), indent=2))
+        elif args.command == "deliver":
+            result = deliver(args.name, text=args.text, file=args.file, topic=args.topic, sender=args.sender,
+                             timeout_seconds=args.timeout_seconds)
+            print(json.dumps(result, indent=2))
+            return 0 if result["verified"] in ("yes", "unverified") else 1
+        elif args.command == "wait":
+            until = [s.strip() for s in args.until.split(",") if s.strip()]
+            result = wait_for(args.name, until, timeout_seconds=args.timeout_seconds)
+            print(json.dumps(result, indent=2))
+            return {"timeout": 2, "gone": 3}.get(result["state"], 0)
         elif args.command == "report-path":
             path = status_report_path(args.name)
             os.makedirs(os.path.dirname(path), exist_ok=True)

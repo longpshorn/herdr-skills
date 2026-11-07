@@ -1,5 +1,7 @@
 """Tests for herdr_tools: its pure logic, and its herdr flows against a stubbed `herdr`. Run: python3 -m unittest discover -s <this dir> -p 'test_*.py'"""
 import contextlib
+import datetime
+import hashlib
 import io
 import json
 import os
@@ -2366,3 +2368,287 @@ class SkillTextIsToolNeutral(unittest.TestCase):
             for name in (n for n in files if n.endswith(".md")):
                 with open(os.path.join(folder, name), encoding="utf-8") as handle:
                     self.assertNotIn("Claude's folder-trust", handle.read(), name)
+
+
+# ---- deliver and wait -------------------------------------------------------------------------------------------
+
+NOW = datetime.datetime(2026, 11, 6, 23, 15, 7)
+
+
+def prompt_entry(text):
+    return {"type": "user", "message": {"role": "user", "content": text}}
+
+
+def tool_entry(name, **tool_input):
+    return {"type": "assistant", "message": {"role": "assistant", "content": [
+        {"type": "tool_use", "id": "t1", "name": name, "input": tool_input}]}}
+
+
+def result_entry():
+    return {"type": "user", "message": {"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]}}
+
+
+class MessageFiles(unittest.TestCase):
+    def setUp(self):
+        self.home = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.home)
+
+    def test_the_file_is_under_the_agents_message_folder_named_by_time_and_topic(self):
+        path = ht.message_path("irt-102-1-dedupe", "Plan verdict!", NOW, home=self.home)
+        self.assertEqual(path, os.path.join(self.home, ".cache", "herdr", "messages", "irt-102-1-dedupe",
+                                            "20261106-231507-plan-verdict.md"))
+        self.assertTrue(os.path.isdir(os.path.dirname(path)))
+
+    def test_a_second_message_in_the_same_second_never_overwrites_the_first(self):
+        first = ht.message_path("a", "x", NOW, home=self.home)
+        open(first, "w").close()
+        self.assertTrue(ht.message_path("a", "x", NOW, home=self.home).endswith("20261106-231507-x-2.md"))
+
+    def test_a_topic_with_nothing_usable_still_gets_a_name(self):
+        self.assertTrue(ht.message_path("a", "!!!", NOW, home=self.home).endswith("-message.md"))
+
+    def test_the_pointer_names_sender_path_and_short_hash(self):
+        self.assertEqual(ht.pointer_line("irt-102", "/m/x.md", "0123456789abcdef"),
+                         "Message from irt-102: read /m/x.md (sha256 0123456789ab) and act on it.")
+
+
+class DeliveryState(unittest.TestCase):
+    POINTER = "Message from p: read /m/x.md (sha256 0123456789ab) and act on it."
+
+    def state(self, entries):
+        return ht.delivery_state(entries, self.POINTER, "/m/x.md")
+
+    def test_nothing_arrived(self):
+        self.assertEqual(self.state([prompt_entry("earlier work")]),
+                         {"delivered": False, "read": False, "newest_prompt": "earlier work"})
+
+    def test_a_truncated_pointer_is_not_delivered(self):
+        self.assertFalse(self.state([prompt_entry(self.POINTER[40:])])["delivered"])
+
+    def test_arrived_but_not_yet_read(self):
+        state = self.state([prompt_entry(self.POINTER), result_entry()])
+        self.assertEqual((state["delivered"], state["read"]), (True, False))
+
+    def test_read_with_the_read_tool(self):
+        self.assertTrue(self.state([prompt_entry(self.POINTER), tool_entry("Read", file_path="/m/x.md")])["read"])
+
+    def test_read_with_a_shell_command(self):
+        entries = [prompt_entry(self.POINTER), tool_entry("Bash", command="cat '/m/x.md'")]
+        self.assertTrue(self.state(entries)["read"])
+
+    def test_a_read_before_the_pointer_does_not_count(self):
+        entries = [tool_entry("Read", file_path="/m/x.md"), prompt_entry(self.POINTER)]
+        self.assertFalse(self.state(entries)["read"])
+
+    def test_tool_results_are_not_prompts(self):
+        self.assertEqual(self.state([prompt_entry("asked"), result_entry()])["newest_prompt"], "asked")
+
+    def test_a_prompt_made_of_text_blocks_counts(self):
+        entry = {"type": "user", "message": {"content": [{"type": "text", "text": self.POINTER}]}}
+        self.assertTrue(self.state([entry])["delivered"])
+
+
+class FindTranscript(unittest.TestCase):
+    def test_finds_the_session_in_any_project_folder(self):
+        home = tempfile.mkdtemp()
+        try:
+            folder = os.path.join(home, ".claude", "projects", "-some-mangled-cwd")
+            os.makedirs(folder)
+            path = os.path.join(folder, "abc-123.jsonl")
+            open(path, "w").close()
+            self.assertEqual(ht.find_transcript("abc-123", home=home), path)
+            self.assertIsNone(ht.find_transcript("missing", home=home))
+        finally:
+            shutil.rmtree(home)
+
+    def test_reads_entries_and_skips_broken_lines(self):
+        handle = tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False)
+        handle.write(json.dumps(prompt_entry("a")) + "\n{not json\n\n" + json.dumps(prompt_entry("b")) + "\n")
+        handle.close()
+        try:
+            self.assertEqual([e["message"]["content"] for e in ht.transcript_entries(handle.name)], ["a", "b"])
+        finally:
+            os.remove(handle.name)
+
+
+class FakeDeliverHerdr:
+    """One agent with a Claude transcript. on_prompt(fake, text) decides what the transcript records for each send."""
+
+    def __init__(self, transcript, kind="claude", session="sess-1", statuses=("idle",), on_prompt=None, reads=None):
+        self.transcript, self.kind, self.session = transcript, kind, session
+        self.statuses, self.calls, self.prompts = list(statuses), [], []
+        self.on_prompt = on_prompt or (lambda fake, text: fake.record(prompt_entry(text)))
+        self.reads = reads  # (path appended to the transcript as a Read after this many `agent get` polls), or None
+
+    def record(self, *entries):
+        with open(self.transcript, "a") as handle:
+            for entry in entries:
+                handle.write(json.dumps(entry) + "\n")
+
+    def __call__(self, *args, parse=True):
+        self.calls.append(args)
+        if args[:2] == ("agent", "prompt"):
+            self.prompts.append(args[3])
+            self.on_prompt(self, args[3])
+            return {"result": {}}
+        if args[:2] == ("agent", "get"):
+            status = self.statuses.pop(0) if len(self.statuses) > 1 else self.statuses[0]
+            if self.reads is not None:
+                self.reads[1] -= 1
+                if self.reads[1] == 0:
+                    self.record(tool_entry("Read", file_path=self.reads[0]))
+            return {"result": {"agent": {"agent_status": status, "agent": self.kind,
+                                         "agent_session": {"value": self.session} if self.session else None}}}
+        raise AssertionError("unexpected herdr call: %r" % (args,))
+
+
+class Deliver(AgentHerdrTest):
+    def setUp(self):
+        super().setUp()
+        folder = os.path.join(self.home, ".claude", "projects", "-x")
+        os.makedirs(folder)
+        self.transcript = os.path.join(folder, "sess-1.jsonl")
+        open(self.transcript, "w").close()
+
+    def deliver(self, fake, **kwargs):
+        self.use(fake)
+        options = dict(text="Approved, with two restrictions.", topic="verdict", sender="parent", now=NOW,
+                       timeout_seconds=30, poll_seconds=1, resend_after_seconds=5, sleep=lambda s: None)
+        options.update(kwargs)
+        return ht.deliver("child", **options)
+
+    def message_path(self):
+        return os.path.join(self.home, ".cache", "herdr", "messages", "child", "20261106-231507-verdict.md")
+
+    def test_writes_the_whole_message_to_a_file_and_sends_only_the_pointer(self):
+        fake = FakeDeliverHerdr(self.transcript, reads=None)
+        fake.reads = [self.message_path(), 2]
+        result = self.deliver(fake)
+        with open(self.message_path()) as handle:
+            self.assertEqual(handle.read(), "Approved, with two restrictions.")
+        digest = hashlib.sha256(b"Approved, with two restrictions.").hexdigest()
+        self.assertEqual(fake.prompts, ["Message from parent: read %s (sha256 %s) and act on it."
+                                        % (self.message_path(), digest[:12])])
+        self.assertEqual((result["verified"], result["delivered"], result["read"], result["attempts"]),
+                         ("yes", True, True, 1))
+        self.assertEqual(result["sha256"], digest)
+
+    def test_a_message_file_is_sent_as_written(self):
+        source = os.path.join(self.home, "verdict.md")
+        with open(source, "w") as handle:
+            handle.write("long verdict " * 200)
+        fake = FakeDeliverHerdr(self.transcript)
+        fake.reads = [self.message_path(), 1]
+        result = self.deliver(fake, text=None, file=source)
+        with open(result["path"]) as handle:
+            self.assertEqual(handle.read(), "long verdict " * 200)
+
+    def test_a_pointer_that_never_arrived_is_resent_once_to_an_idle_agent(self):
+        sent = []
+        def lose_the_first(fake, text):
+            sent.append(text)
+            if len(sent) == 2:
+                fake.record(prompt_entry(text))
+        fake = FakeDeliverHerdr(self.transcript, on_prompt=lose_the_first)
+        fake.reads = [self.message_path(), 9]
+        result = self.deliver(fake)
+        self.assertEqual(len(fake.prompts), 2)
+        self.assertEqual((result["verified"], result["attempts"]), ("yes", 2))
+
+    def test_a_pointer_that_never_arrives_is_reported_after_one_resend(self):
+        fake = FakeDeliverHerdr(self.transcript, on_prompt=lambda fake, text: None)
+        result = self.deliver(fake)
+        self.assertEqual(len(fake.prompts), 2)
+        self.assertEqual((result["verified"], result["delivered"]), ("no", False))
+
+    def test_a_working_agent_is_never_sent_a_second_pointer(self):
+        fake = FakeDeliverHerdr(self.transcript, statuses=["working"], on_prompt=lambda fake, text: None)
+        result = self.deliver(fake)
+        self.assertEqual(len(fake.prompts), 1)
+        self.assertEqual(result["verified"], "no")
+
+    def test_arrived_but_unread_is_reported_without_a_resend(self):
+        fake = FakeDeliverHerdr(self.transcript)
+        result = self.deliver(fake)
+        self.assertEqual(len(fake.prompts), 1)
+        self.assertEqual((result["verified"], result["delivered"], result["read"]), ("no", True, False))
+        self.assertIn("not read", result["detail"])
+
+    def test_a_changed_file_fails_the_hash_check(self):
+        def tamper(fake, text):
+            fake.record(prompt_entry(text), tool_entry("Read", file_path=self.message_path()))
+            with open(self.message_path(), "w") as handle:
+                handle.write("something else")
+        result = self.deliver(FakeDeliverHerdr(self.transcript, on_prompt=tamper))
+        self.assertEqual(result["verified"], "no")
+        self.assertIn("changed", result["detail"])
+
+    def test_other_agent_kinds_are_unverified(self):
+        fake = FakeDeliverHerdr(self.transcript, kind="codex", on_prompt=lambda fake, text: None)
+        result = self.deliver(fake)
+        self.assertEqual((result["verified"], len(fake.prompts)), ("unverified", 1))
+
+    def test_a_claude_agent_without_a_session_id_is_unverified(self):
+        result = self.deliver(FakeDeliverHerdr(self.transcript, session=None, on_prompt=lambda fake, text: None))
+        self.assertEqual(result["verified"], "unverified")
+
+    def test_needs_exactly_one_of_text_or_file(self):
+        with self.assertRaisesRegex(ht.HerdrError, "exactly one"):
+            self.deliver(FakeDeliverHerdr(self.transcript), text=None)
+
+
+class FakeWaitHerdr:
+    def __init__(self, statuses):
+        self.statuses = list(statuses)
+
+    def __call__(self, *args, parse=True):
+        status = self.statuses.pop(0) if len(self.statuses) > 1 else self.statuses[0]
+        if status == "gone":
+            raise ht.HerdrError('{"error":{"code":"agent_not_found","message":"agent target a not found"}}')
+        return {"result": {"agent": {} if status is None else {"agent_status": status}}}
+
+
+class Wait(AgentHerdrTest):
+    def wait(self, statuses, until=("idle",), **kwargs):
+        self.use(FakeWaitHerdr(statuses))
+        options = dict(timeout_seconds=20, poll_seconds=1, gone_seconds=5, sleep=lambda s: None)
+        options.update(kwargs)
+        return ht.wait_for("a", until, **options)
+
+    def test_returns_the_first_wanted_state(self):
+        self.assertEqual(self.wait(["working", "working", "blocked"], until=("idle", "blocked"))["state"], "blocked")
+
+    def test_blank_missing_and_unknown_statuses_mean_keep_waiting(self):
+        self.assertEqual(self.wait(["", None, "unknown", "idle"], until=("idle", "unknown"))["state"], "idle")
+
+    def test_a_short_absence_is_waited_through(self):
+        self.assertEqual(self.wait(["gone", "gone", "idle"])["state"], "idle")
+
+    def test_an_agent_gone_past_the_grace_period_is_reported_gone(self):
+        self.assertEqual(self.wait(["gone"])["state"], "gone")
+
+    def test_times_out_with_the_last_status_seen(self):
+        self.assertEqual(self.wait(["working"]), {"agent": "a", "state": "timeout", "last": "working", "waited": 20})
+
+    def test_other_herdr_errors_are_raised(self):
+        class Broken:
+            def __call__(self, *args, parse=True):
+                raise ht.HerdrError("herdr server not running")
+        self.use(Broken())
+        with self.assertRaisesRegex(ht.HerdrError, "not running"):
+            ht.wait_for("a", ("idle",), timeout_seconds=5, poll_seconds=1, sleep=lambda s: None)
+
+
+class RebaseRequestIsDelivered(unittest.TestCase):
+    def test_land_and_watch_send_the_rebase_request_as_a_file(self):
+        calls, saved = [], ht.deliver
+        ht.deliver = lambda agent, **kwargs: calls.append((agent, kwargs)) or {"verified": "yes"}
+        try:
+            ht.ask_to_rebase("proj105", ht.REBASE_REQUEST)
+        finally:
+            ht.deliver = saved
+        self.assertEqual(calls, [("proj105", {"text": ht.REBASE_REQUEST, "topic": "rebase request",
+                                              "timeout_seconds": 120})])

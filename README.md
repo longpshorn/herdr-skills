@@ -94,7 +94,7 @@ Retire checks that the worktree's HEAD landed. When `land` rebased the MR first,
 | `/herdr:status` | See every agent, the ones needing you (`blocked`, `done`) first, with its workspace and what it is doing |
 | `/herdr:spawn <ticket>` | Start an agent on a ticket in its own worktree, from a brief |
 | `/herdr:peek <agent>` | Read what an agent is doing or asking, without sending it anything |
-| `/herdr:ask <agent> <message>` | Answer a plan gate or question, or send an instruction; optionally wait for the reply |
+| `/herdr:ask <agent> <message>` | Answer a plan gate or question, or send an instruction, as a file plus a one-line pointer so long messages arrive whole (checked in the agent's transcript for Claude agents); optionally wait for the reply |
 | `/herdr:run <command>` | Run a dev server, test run or watcher in a sibling pane and read its output |
 | `/herdr:retire <agent>` | Land a validated MR, clean up, close the ticket, update main, capture follow-ups |
 
