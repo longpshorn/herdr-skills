@@ -3271,6 +3271,17 @@ class RetireTarget(LayoutTest):
         with self.assertRaisesRegex(ht.HerdrError, "this session"):
             self.target(own_pane=pane)
 
+    def test_a_retired_record_still_serves_a_child_that_is_gone(self):
+        ht.write_record(child_record(worktree=self.worktree, state="retired"))
+        self.assertEqual(self.target()[1]["child"], "irt-102-1-dedupe")
+
+    def test_a_retired_record_is_ignored_once_its_name_runs_again_as_a_one_workspace_agent(self):
+        ht.write_record(child_record("proj9", state="retired", worktree=self.worktree))
+        self.fake.add_workspace("PROJ-9 x", worktree=linked("/code/repo-PROJ-9"))
+        self.fake.add_agent("proj9", [p for p, row in self.fake.panes.items() if row["workspace_id"] == "w2"][0])
+        ws, record = self.target("proj9")
+        self.assertEqual((ws["workspace_id"], record), ("w2", None))
+
     def test_an_agent_without_a_record_takes_the_one_workspace_path_unchanged(self):
         self.fake.add_workspace("PROJ-9 x", worktree=linked("/code/repo-PROJ-9"))
         pane = [p for p, row in self.fake.panes.items() if row["workspace_id"] == "w2"][0]

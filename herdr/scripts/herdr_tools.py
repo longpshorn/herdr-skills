@@ -981,8 +981,11 @@ def child_retire_target(record, agents, own_pane):
 
 
 def retire_target(target, agents, workspace_list, own_workspace, own_pane):
-    """(workspace-like dict, record): a recorded child by its record; anything else as find_retire_target finds it."""
+    """(workspace-like dict, record): a recorded child by its record; anything else as find_retire_target finds it. A
+    retired record whose name runs again (reused for an agent launched without --parent) no longer applies."""
     record = read_record(target) if AGENT_NAME.match(target or "") else None
+    if record is not None and record.get("state") == "retired" and find_agent(target, agents) is not None:
+        record = None
     if record is None:
         return find_retire_target(workspace_list, agents, target, own_workspace), None
     return child_retire_target(record, agents, own_pane), record
