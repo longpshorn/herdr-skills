@@ -1606,6 +1606,12 @@ def launch(path, label, name, kind, prompt, sleep=time.sleep, busy_timeout_secon
     summary = {"workspace_id": opened["workspace"]["workspace_id"], "pane_id": pane, "agent": name, "label": label}
     if opened.get("already_open"):
         summary["note"] = "The worktree already had a workspace; reused it."
+    return start_and_prompt(name, kind, pane, prompt, summary, sleep, busy_timeout_seconds)
+
+
+def start_and_prompt(name, kind, pane, prompt, summary, sleep=time.sleep, busy_timeout_seconds=PANE_BUSY_TIMEOUT):
+    """Start the agent in PANE; at a folder-trust prompt save the prompt for send-prompt, otherwise send it and confirm
+    the agent started working. Returns SUMMARY with the outcome added."""
     start_error = None
     try:
         start_agent(name, kind, pane, sleep, busy_timeout_seconds)
@@ -1629,6 +1635,93 @@ def launch(path, label, name, kind, prompt, sleep=time.sleep, busy_timeout_secon
         return summary
     summary.update(status=prompt_and_confirm(name, prompt, sleep), trust_prompt=False, prompted=True)
     return summary
+
+
+def agent_list():
+    return herdr("agent", "list")["result"]["agents"]
+
+
+def find_agent(name, agents):
+    return next((a for a in agents if a.get("name") == name), None)
+
+
+def locate_record(record, agents=None):
+    """The agent a record names, found by name (pane ids change when a pane moves to another workspace); its new ids
+    are saved to the record. None when no agent has that name: nothing acts on a recorded id that may be stale."""
+    agent = find_agent(record["child"], agent_list() if agents is None else agents)
+    if agent is None:
+        return None
+    where = {key: agent.get(key) for key in ("workspace_id", "tab_id", "pane_id")}
+    if any(record.get(key) != value for key, value in where.items()):
+        record.update(update_record(record["child"], "located", **where))
+    return agent
+
+
+def child_pane_command(layout, parent_agent, path, label):
+    """The herdr call that opens a child's pane: a labelled tab in the parent's workspace, or a split of its pane."""
+    if layout == "workspace":
+        return ("tab", "create", "--workspace", parent_agent["workspace_id"], "--cwd", path, "--label", label,
+                "--no-focus")
+    if layout == "shared":
+        return ("pane", "split", parent_agent["pane_id"], "--direction", "right", "--cwd", path, "--no-focus")
+    raise HerdrError("The layout must be workspace or shared, not %r." % layout)
+
+
+def child_number(name, parent, records):
+    match = re.match(re.escape(parent) + r"-(\d+)-", name)
+    return int(match.group(1)) if match else next_child_n(parent, records)
+
+
+def launch_child(path, name, kind, prompt, parent, key, topic, layout="workspace", sleep=time.sleep,
+                 busy_timeout_seconds=PANE_BUSY_TIMEOUT):
+    """launch for a child of a running, named parent: open its pane by LAYOUT next to the parent, start the agent as
+    launch does, and write its record."""
+    if layout not in LAYOUTS:
+        raise HerdrError("The layout must be workspace or shared, not %r." % layout)
+    if not AGENT_NAME.match(name):
+        raise HerdrError("%r is not a Herdr agent name." % name)
+    existing = read_record(name)
+    if existing and existing.get("state") == "live":
+        raise HerdrError("%s already has a live record (%s); pick another name, or retire it first."
+                         % (name, agent_record_path(name)))
+    parent_agent = find_agent(parent, agent_list())
+    if parent_agent is None:
+        raise HerdrError("No agent named %r: --parent must be a running, named agent." % parent)
+    path = os.path.abspath(os.path.expanduser(path))
+    main = repo_root(path)
+    n = child_number(name, parent, list_records())
+    label = child_label(n, key, topic)
+    opened = herdr(*child_pane_command(layout, parent_agent, path, label))["result"]
+    pane = opened.get("root_pane") or opened["pane"]
+    record = {"child": name, "parent": parent, "n": n, "key": key, "label": label, "layout": layout,
+              "workspace_id": pane["workspace_id"], "tab_id": pane["tab_id"], "pane_id": pane["pane_id"],
+              "worktree": path, "branch": git(path, "branch", "--show-current")[1] or None, "main_checkout": main,
+              "spawned_at": now_stamp(), "state": "live", "history": []}
+    summary = {"workspace_id": pane["workspace_id"], "tab_id": pane["tab_id"], "pane_id": pane["pane_id"],
+               "agent": name, "label": label, "parent": parent, "layout": layout}
+    summary = start_and_prompt(name, kind, pane["pane_id"], prompt, summary, sleep, busy_timeout_seconds)
+    record["history"].append({"at": record["spawned_at"], "event": "spawned"})
+    write_record(record)
+    summary["record"] = agent_record_path(name)
+    return summary
+
+
+def open_parent(name, label, cwd, shared_label, kind, prompt, sleep=time.sleep,
+                busy_timeout_seconds=PANE_BUSY_TIMEOUT):
+    """Start a parent agent as a tab labelled LABEL in the shared workspace SHARED_LABEL, creating the workspace (and
+    using its first tab) when there is none."""
+    cwd = os.path.abspath(os.path.expanduser(cwd))
+    ws = next((w for w in workspaces() if w.get("label") == shared_label), None)
+    if ws is None:
+        opened = herdr("workspace", "create", "--cwd", cwd, "--label", shared_label, "--no-focus")["result"]
+        herdr("tab", "rename", opened["tab"]["tab_id"], label, parse=False)
+    else:
+        opened = herdr("tab", "create", "--workspace", ws["workspace_id"], "--cwd", cwd, "--label", label,
+                       "--no-focus")["result"]
+    pane = opened["root_pane"]
+    summary = {"workspace_id": pane["workspace_id"], "tab_id": pane["tab_id"], "pane_id": pane["pane_id"],
+               "agent": name, "label": label, "shared_label": shared_label}
+    return start_and_prompt(name, kind, pane["pane_id"], prompt, summary, sleep, busy_timeout_seconds)
 
 
 REPO_LAUNCH_TIMEOUT = 120
@@ -2064,6 +2157,13 @@ def install_skills_command(args):
                           dry_run=args.dry_run)
 
 
+def read_prompt(args):
+    if args.prompt is not None:
+        return args.prompt
+    with open(args.prompt_file) as handle:
+        return handle.read().strip()
+
+
 # ---- CLI -----------------------------------------------------------------------------------------------------------
 
 
@@ -2077,12 +2177,28 @@ def main(argv=None):
     pw.add_argument("--wait-seconds", type=float, default=PARENT_WAIT_SECONDS)
     ln = sub.add_parser("launch")
     ln.add_argument("--path", required=True)
-    ln.add_argument("--label", required=True)
+    ln.add_argument("--label", help="the workspace label; not with --parent, whose child's tab label is built")
     ln.add_argument("--name", required=True)
     ln.add_argument("--kind", default="claude")
+    ln.add_argument("--parent", help="a running, named agent; the child opens next to it and gets a record")
+    ln.add_argument("--layout", choices=LAYOUTS, default="workspace")
+    ln.add_argument("--key")
+    ln.add_argument("--topic")
     group = ln.add_mutually_exclusive_group(required=True)
     group.add_argument("--prompt")
     group.add_argument("--prompt-file")
+    nc = sub.add_parser("next-child-name")
+    nc.add_argument("--parent", required=True)
+    nc.add_argument("--slug", required=True)
+    op = sub.add_parser("open-parent")
+    op.add_argument("--name", required=True)
+    op.add_argument("--label", required=True)
+    op.add_argument("--cwd", required=True)
+    op.add_argument("--shared-label", required=True)
+    op.add_argument("--kind", default="claude")
+    op_group = op.add_mutually_exclusive_group(required=True)
+    op_group.add_argument("--prompt")
+    op_group.add_argument("--prompt-file")
     rl = sub.add_parser("repo-launch")
     rl.add_argument("--path", required=True)
     rl.add_argument("--key", required=True)
@@ -2168,9 +2284,22 @@ def main(argv=None):
         elif args.command == "parent-workspace":
             ws = parent_workspace(args.path, args.create, args.wait_seconds)
             print(json.dumps({"workspace_id": ws["workspace_id"], "label": ws.get("label")}))
+        elif args.command == "launch" and args.parent:
+            if not (args.key and args.topic):
+                raise HerdrError("launch --parent needs --key and --topic for the child's tab label.")
+            print(json.dumps(launch_child(args.path, args.name, args.kind, read_prompt(args), args.parent, args.key,
+                                          args.topic, args.layout), indent=2))
         elif args.command == "launch":
-            prompt = args.prompt if args.prompt is not None else open(args.prompt_file).read().strip()
-            print(json.dumps(launch(args.path, args.label, args.name, args.kind, prompt), indent=2))
+            if not args.label:
+                raise HerdrError("launch needs --label (the workspace label) unless it has --parent.")
+            print(json.dumps(launch(args.path, args.label, args.name, args.kind, read_prompt(args)), indent=2))
+        elif args.command == "next-child-name":
+            if find_agent(args.parent, agent_list()) is None:
+                raise HerdrError("No agent named %r: --parent must be a running, named agent." % args.parent)
+            print(next_child_name(args.parent, args.slug, list_records()))
+        elif args.command == "open-parent":
+            print(json.dumps(open_parent(args.name, args.label, args.cwd, args.shared_label, args.kind,
+                                         read_prompt(args)), indent=2))
         elif args.command == "repo-launch":
             main = repo_root(args.path)
             print(json.dumps(repo_launch(main, project_profile(main), {"key": args.key, "branch": args.branch},

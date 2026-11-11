@@ -2738,3 +2738,332 @@ class ChildNames(unittest.TestCase):
 
     def test_the_tab_label_carries_number_key_and_topic(self):
         self.assertEqual(ht.child_label(3, "PROJ-9", "dedupe rows"), "3 PROJ-9 dedupe rows")
+
+
+def opt(args, flag):
+    return args[args.index(flag) + 1] if flag in args else None
+
+
+class FakeLayoutHerdr:
+    """A small in-memory Herdr: workspaces, tabs, panes and named agents, with the creates, moves and closes the
+    layout commands use. Ids carry their workspace id, as Herdr's do, so moving a pane to another workspace renumbers
+    it, and Herdr removes a tab or workspace a move or close leaves empty (both checked against Herdr 0.9.5)."""
+
+    def __init__(self):
+        self.calls, self.workspaces, self.tabs, self.panes, self.agents = [], {}, {}, {}, {}
+        self.busy, self.counters, self.next_ws, self.screen = {}, {}, 0, "> "
+
+    # -- building the starting state
+    def new_id(self, ws, kind):
+        self.counters[(ws, kind)] = self.counters.get((ws, kind), 0) + 1
+        return "%s:%s%d" % (ws, kind, self.counters[(ws, kind)])
+
+    def add_workspace(self, label, cwd="/", worktree=None, tab_label="1"):
+        self.next_ws += 1
+        ws = "w%d" % self.next_ws
+        self.workspaces[ws] = {"workspace_id": ws, "label": label}
+        if worktree:
+            self.workspaces[ws]["worktree"] = worktree
+        tab = self.add_tab(ws, tab_label)
+        return ws, tab, self.add_pane(tab, cwd)
+
+    def add_tab(self, ws, label):
+        tab = self.new_id(ws, "t")
+        self.tabs[tab] = {"tab_id": tab, "workspace_id": ws, "label": label}
+        return tab
+
+    def add_pane(self, tab, cwd="/"):
+        ws = self.tabs[tab]["workspace_id"]
+        pane = self.new_id(ws, "p")
+        self.panes[pane] = {"pane_id": pane, "tab_id": tab, "workspace_id": ws, "cwd": cwd}
+        return pane
+
+    def add_agent(self, name, pane, status="idle", kind="claude"):
+        self.agents[name] = {"name": name, "pane_id": pane, "agent_status": status, "agent": kind}
+
+    # -- reading it back
+    def agent_rows(self):
+        rows = []
+        for agent in self.agents.values():
+            pane = self.panes[agent["pane_id"]]
+            rows.append(dict(agent, tab_id=pane["tab_id"], workspace_id=pane["workspace_id"], cwd=pane["cwd"]))
+        return rows
+
+    def agent_named(self, name):
+        return next(a for a in self.agent_rows() if a["name"] == name)
+
+    def ws_row(self, ws):
+        return dict(self.workspaces[ws], pane_count=len([p for p in self.panes.values() if p["workspace_id"] == ws]),
+                    tab_count=len([t for t in self.tabs.values() if t["workspace_id"] == ws]))
+
+    def labels(self):
+        return sorted(w["label"] for w in self.workspaces.values())
+
+    def called(self, *prefix):
+        return [c for c in self.calls if c[:len(prefix)] == prefix]
+
+    # -- changes
+    def remove_pane(self, pane):
+        tab = self.panes.pop(pane)["tab_id"]
+        for name in [n for n, a in self.agents.items() if a["pane_id"] == pane]:
+            del self.agents[name]
+        self.busy.pop(pane, None)
+        if not any(p["tab_id"] == tab for p in self.panes.values()):
+            ws = self.tabs.pop(tab)["workspace_id"]
+            if not any(t["workspace_id"] == ws for t in self.tabs.values()):
+                del self.workspaces[ws]
+
+    def move_pane(self, pane, tab):
+        new = self.add_pane(tab, self.panes[pane]["cwd"])
+        for agent in self.agents.values():
+            if agent["pane_id"] == pane:
+                agent["pane_id"] = new
+        if pane in self.busy:
+            self.busy[new] = self.busy.pop(pane)
+        self.remove_pane(pane)
+        return self.panes[new]
+
+    def __call__(self, *args, parse=True):
+        self.calls.append(args)
+        head = args[:2]
+        if head == ("agent", "list"):
+            return {"result": {"agents": self.agent_rows()}}
+        if head == ("agent", "get"):
+            if args[2] not in self.agents:
+                raise ht.HerdrError('{"error":{"code":"agent_not_found"}}')
+            return {"result": {"agent": self.agent_named(args[2])}}
+        if head == ("agent", "start"):
+            self.add_agent(args[2], opt(args, "--pane"), "idle", opt(args, "--kind"))
+            return {"result": {}}
+        if head == ("agent", "read"):
+            return self.screen
+        if head == ("agent", "prompt"):
+            self.agents[args[2]]["agent_status"] = "working"
+            return {"result": {}}
+        if head == ("workspace", "list"):
+            return {"result": {"workspaces": [self.ws_row(ws) for ws in self.workspaces]}}
+        if head == ("workspace", "create"):
+            ws, tab, pane = self.add_workspace(opt(args, "--label"), opt(args, "--cwd"))
+            return {"result": {"workspace": self.ws_row(ws), "tab": self.tabs[tab], "root_pane": self.panes[pane]}}
+        if head == ("workspace", "close"):
+            for pane in [p for p, row in self.panes.items() if row["workspace_id"] == args[2]]:
+                self.remove_pane(pane)
+            return ""
+        if head == ("tab", "list"):
+            ws = opt(args, "--workspace")
+            return {"result": {"tabs": [t for t in self.tabs.values() if ws in (None, t["workspace_id"])]}}
+        if head == ("tab", "create"):
+            tab = self.add_tab(opt(args, "--workspace"), opt(args, "--label"))
+            pane = self.add_pane(tab, opt(args, "--cwd"))
+            return {"result": {"tab": self.tabs[tab], "root_pane": self.panes[pane]}}
+        if head == ("tab", "rename"):
+            self.tabs[args[2]]["label"] = args[3]
+            return ""
+        if head == ("tab", "close"):
+            for pane in [p for p, row in self.panes.items() if row["tab_id"] == args[2]]:
+                self.remove_pane(pane)
+            return ""
+        if head == ("pane", "list"):
+            ws = opt(args, "--workspace")
+            return {"result": {"panes": [p for p in self.panes.values() if ws in (None, p["workspace_id"])]}}
+        if head == ("pane", "split"):
+            pane = self.add_pane(self.panes[args[2]]["tab_id"], opt(args, "--cwd"))
+            return {"result": {"pane": self.panes[pane]}}
+        if head == ("pane", "close"):
+            self.remove_pane(args[2])
+            return ""
+        if head == ("pane", "process-info"):
+            pane = opt(args, "--pane")
+            name = self.busy.get(pane, "zsh")
+            return {"result": {"process_info": {"pane_id": pane, "shell_pid": 1, "foreground_processes": [
+                {"name": name, "pid": 1 if name == "zsh" else 2, "cmdline": name}]}}}
+        if head == ("pane", "move"):
+            pane = args[2]
+            if "--new-workspace" in args:
+                self.next_ws += 1
+                ws = "w%d" % self.next_ws
+                self.workspaces[ws] = {"workspace_id": ws, "label": opt(args, "--label")}
+                tab = self.add_tab(ws, opt(args, "--tab-label") or "1")
+            elif "--new-tab" in args:
+                tab = self.add_tab(opt(args, "--workspace"), opt(args, "--label"))
+            else:
+                tab = opt(args, "--tab")
+                target = opt(args, "--target-pane")
+                assert target is None or self.panes[target]["tab_id"] == tab, "target pane is not in --tab"
+            return {"result": {"move_result": {"pane": self.move_pane(pane, tab)}}}
+        raise AssertionError("unexpected herdr call: %r" % (args,))
+
+
+class LayoutTest(HomeTest):
+    """A parent agent irt-102 in its own workspace, against FakeLayoutHerdr, with git and repo_root stubbed."""
+
+    def setUp(self):
+        super().setUp()
+        self.saved = ht.herdr, ht.repo_root, ht.git
+        self.fake = FakeLayoutHerdr()
+        self.parent_ws, self.parent_tab, self.parent_pane = self.fake.add_workspace("IRT-102 parent", "/code/repo")
+        self.fake.add_agent("irt-102", self.parent_pane)
+        ht.herdr, ht.repo_root = self.fake, lambda path: REPO
+        ht.git = lambda path, *args: (0, "fix/PROJ-1-dedupe")
+
+    def tearDown(self):
+        ht.herdr, ht.repo_root, ht.git = self.saved
+        super().tearDown()
+
+    def launch_child(self, name="irt-102-1-dedupe", layout="workspace", **kw):
+        return ht.launch_child("/code/repo-PROJ-1", name, "claude", "Read the brief", "irt-102", "PROJ-1", "dedupe",
+                               layout=layout, sleep=lambda s: None, **kw)
+
+
+class LocateRecord(LayoutTest):
+    def test_finds_a_moved_child_by_name_and_saves_its_new_ids(self):
+        _, tab, pane = self.fake.add_workspace("elsewhere")
+        self.fake.add_agent("irt-102-1-dedupe", pane)
+        ht.write_record(child_record())
+        agent = ht.locate_record(ht.read_record("irt-102-1-dedupe"))
+        self.assertEqual(agent["pane_id"], pane)
+        record = ht.read_record("irt-102-1-dedupe")
+        self.assertEqual((record["workspace_id"], record["tab_id"], record["pane_id"]), ("w2", tab, pane))
+        self.assertEqual(record["history"][-1]["event"], "located")
+
+    def test_a_child_not_listed_is_gone_and_its_record_is_left_alone(self):
+        ht.write_record(child_record())
+        self.assertIsNone(ht.locate_record(ht.read_record("irt-102-1-dedupe")))
+        self.assertEqual(ht.read_record("irt-102-1-dedupe"), child_record())
+
+
+class LaunchChild(LayoutTest):
+    def test_workspace_layout_opens_the_child_as_a_labelled_tab_in_the_parents_workspace(self):
+        summary = self.launch_child()
+        self.assertEqual(self.fake.called("tab", "create"), [(
+            "tab", "create", "--workspace", self.parent_ws, "--cwd", os.path.abspath("/code/repo-PROJ-1"),
+            "--label", "1 PROJ-1 dedupe", "--no-focus")])
+        child = self.fake.agent_named("irt-102-1-dedupe")
+        self.assertEqual(child["workspace_id"], self.parent_ws)
+        self.assertNotEqual(child["tab_id"], self.parent_tab)
+        self.assertEqual((summary["status"], summary["parent"], summary["tab_id"]), ("working", "irt-102", child["tab_id"]))
+        self.assertEqual(summary["record"], ht.agent_record_path("irt-102-1-dedupe"))
+        self.assertEqual(self.fake.called("worktree"), [])
+
+    def test_the_record_says_where_the_child_is_and_what_it_works_on(self):
+        self.launch_child()
+        record = ht.read_record("irt-102-1-dedupe")
+        child = self.fake.agent_named("irt-102-1-dedupe")
+        self.assertEqual({k: record[k] for k in ("child", "parent", "n", "key", "label", "layout", "workspace_id",
+                                                 "tab_id", "pane_id", "worktree", "branch", "main_checkout", "state")},
+                         {"child": "irt-102-1-dedupe", "parent": "irt-102", "n": 1, "key": "PROJ-1",
+                          "label": "1 PROJ-1 dedupe", "layout": "workspace", "workspace_id": self.parent_ws,
+                          "tab_id": child["tab_id"], "pane_id": child["pane_id"],
+                          "worktree": os.path.abspath("/code/repo-PROJ-1"), "branch": "fix/PROJ-1-dedupe",
+                          "main_checkout": REPO, "state": "live"})
+        self.assertTrue(record["spawned_at"])
+        self.assertEqual([h["event"] for h in record["history"]], ["spawned"])
+
+    def test_shared_layout_splits_the_parents_pane(self):
+        self.launch_child(layout="shared")
+        self.assertEqual(self.fake.called("pane", "split"), [(
+            "pane", "split", self.parent_pane, "--direction", "right", "--cwd", os.path.abspath("/code/repo-PROJ-1"),
+            "--no-focus")])
+        child = self.fake.agent_named("irt-102-1-dedupe")
+        self.assertEqual(child["tab_id"], self.parent_tab)
+        self.assertEqual(ht.read_record("irt-102-1-dedupe")["layout"], "shared")
+
+    def test_the_number_comes_from_the_childs_name_else_counts_up(self):
+        self.launch_child(name="irt-102-4-dedupe")
+        self.assertEqual(ht.read_record("irt-102-4-dedupe")["n"], 4)
+        self.launch_child(name="dedupe-helper")
+        self.assertEqual(ht.read_record("dedupe-helper")["label"], "5 PROJ-1 dedupe")
+
+    def test_at_a_trust_prompt_it_still_records_the_child_and_saves_the_prompt(self):
+        self.fake.screen = TRUST_SCREEN
+        summary = self.launch_child()
+        self.assertEqual((summary["trust_prompt"], summary["prompted"]), (True, False))
+        self.assertEqual(self.fake.called("agent", "prompt"), [])
+        self.assertIsNotNone(ht.read_record("irt-102-1-dedupe"))
+
+    def test_refuses_a_parent_that_is_not_a_running_named_agent(self):
+        with self.assertRaisesRegex(ht.HerdrError, "No agent named 'nobody'"):
+            ht.launch_child("/code/repo-PROJ-1", "nobody-1-x", "claude", "p", "nobody", "PROJ-1", "x",
+                            sleep=lambda s: None)
+        self.assertEqual(self.fake.called("tab"), [])
+
+    def test_refuses_a_name_that_already_has_a_live_record(self):
+        ht.write_record(child_record())
+        with self.assertRaisesRegex(ht.HerdrError, "already has a live record"):
+            self.launch_child()
+        self.assertEqual(self.fake.called("tab"), [])
+
+    def test_refuses_an_unknown_layout(self):
+        with self.assertRaisesRegex(ht.HerdrError, "workspace or shared"):
+            self.launch_child(layout="grid")
+
+
+class OpenParent(LayoutTest):
+    def open(self):
+        return ht.open_parent("irt-200", "IRT-200 outage", "/code/repo", "IRT", "claude", "Read the brief",
+                              sleep=lambda s: None)
+
+    def test_creates_the_shared_workspace_when_missing_and_uses_its_first_tab(self):
+        summary = self.open()
+        ws = next(w for w in self.fake.workspaces.values() if w["label"] == "IRT")
+        tabs = [t for t in self.fake.tabs.values() if t["workspace_id"] == ws["workspace_id"]]
+        self.assertEqual([t["label"] for t in tabs], ["IRT-200 outage"])
+        self.assertEqual(self.fake.agent_named("irt-200")["workspace_id"], ws["workspace_id"])
+        self.assertEqual((summary["workspace_id"], summary["status"]), (ws["workspace_id"], "working"))
+
+    def test_adds_a_tab_to_an_existing_shared_workspace(self):
+        ws, _, _ = self.fake.add_workspace("IRT")
+        self.open()
+        self.assertEqual(self.fake.called("workspace", "create"), [])
+        self.assertEqual(self.fake.called("tab", "create"), [(
+            "tab", "create", "--workspace", ws, "--cwd", os.path.abspath("/code/repo"), "--label", "IRT-200 outage",
+            "--no-focus")])
+        self.assertEqual(self.fake.agent_named("irt-200")["workspace_id"], ws)
+
+
+class LayoutCli(LayoutTest):
+    """The CLI commands for parents and children, run through main() inside a pretend Herdr pane."""
+
+    def setUp(self):
+        super().setUp()
+        saved = os.environ.get("HERDR_ENV")
+        os.environ["HERDR_ENV"] = "1"
+        self.addCleanup(lambda: os.environ.pop("HERDR_ENV") if saved is None else os.environ.__setitem__(
+            "HERDR_ENV", saved))
+
+    def run_main(self, *argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = ht.main(list(argv))
+        return code, out.getvalue(), err.getvalue()
+
+    def test_next_child_name_counts_from_the_parents_records(self):
+        ht.write_record(child_record())
+        self.assertEqual(self.run_main("next-child-name", "--parent", "irt-102", "--slug", "Retry jobs")[:2],
+                         (0, "irt-102-2-retry-jobs\n"))
+
+    def test_next_child_name_refuses_a_parent_that_is_not_running(self):
+        code, _, err = self.run_main("next-child-name", "--parent", "irt-999", "--slug", "x")
+        self.assertEqual(code, 1)
+        self.assertIn("No agent named 'irt-999'", err)
+
+    def test_launch_with_a_parent_needs_a_key_and_topic_but_no_label(self):
+        code, out, _ = self.run_main("launch", "--path", "/code/repo-PROJ-1", "--name", "irt-102-1-dedupe",
+                                     "--parent", "irt-102", "--key", "PROJ-1", "--topic", "dedupe",
+                                     "--layout", "shared", "--prompt", "go")
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out)["layout"], "shared")
+        code, _, err = self.run_main("launch", "--path", "/x", "--name", "irt-102-2-x", "--parent", "irt-102",
+                                     "--prompt", "go")
+        self.assertEqual(code, 1)
+        self.assertIn("--key and --topic", err)
+
+    def test_launch_without_a_parent_still_needs_a_label(self):
+        code, _, err = self.run_main("launch", "--path", "/x", "--name", "x", "--prompt", "go")
+        self.assertEqual(code, 1)
+        self.assertIn("--label", err)
+
+    def test_open_parent_starts_the_parent_in_the_shared_workspace(self):
+        code, out, _ = self.run_main("open-parent", "--name", "irt-200", "--label", "IRT-200 outage", "--cwd",
+                                     "/code/repo", "--shared-label", "IRT", "--prompt", "go")
+        self.assertEqual((code, json.loads(out)["shared_label"]), (0, "IRT"))
