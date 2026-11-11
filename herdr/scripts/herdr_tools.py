@@ -1272,12 +1272,8 @@ def close_plan(target, agents=None):
                 "record": record}
     agent = target_agent(target, ws, None, agents)
     keep = {agent["pane_id"]} if agent else set()
-    panes = herdr("pane", "list", "--workspace", ws["workspace_id"])["result"]["panes"]
-    hosted = {a.get("pane_id") for a in agents}
-    infos = {p["pane_id"]: process_info(p["pane_id"]) for p in panes
-             if p["pane_id"] not in keep and p["pane_id"] not in hosted}
     return {"action": "workspace close", "target": ws["workspace_id"], "label": ws.get("label"),
-            "blockers": close_blockers(panes, agents, infos, keep), "record": None}
+            "blockers": scope_blockers(panes_in(ws["workspace_id"]), agents, keep), "record": None}
 
 
 def retire_close(target):
@@ -1988,6 +1984,149 @@ def collapse(child):
     return close_child(record, "collapse")
 
 
+def panes_in(workspace_id):
+    return herdr("pane", "list", "--workspace", workspace_id)["result"]["panes"]
+
+
+def scope_blockers(panes, agents, keep):
+    hosted = {a.get("pane_id") for a in agents}
+    infos = {p["pane_id"]: process_info(p["pane_id"]) for p in panes
+             if p["pane_id"] not in keep and p["pane_id"] not in hosted}
+    return close_blockers(panes, agents, infos, keep)
+
+
+def parent_close_command(parent_agent, panes, agents):
+    """Close a parent's workspace when nothing else alive is in it; in a shared workspace, only its tab; refuse when its
+    own tab holds anything else alive. Returns (argv, blockers)."""
+    keep = {parent_agent["pane_id"]}
+    if not scope_blockers(panes, agents, keep):
+        return ("workspace", "close", parent_agent["workspace_id"]), []
+    tab_blockers = scope_blockers([p for p in panes if p["tab_id"] == parent_agent["tab_id"]], agents, keep)
+    if tab_blockers:
+        return None, tab_blockers
+    return ("tab", "close", parent_agent["tab_id"]), []
+
+
+def rehome_children(records, agents):
+    """Move each child to the "Orphaned agents" workspace, a tab each (the first move creates the workspace), mark its
+    record rehomed, and return the notice for the caller to relay to the owner."""
+    orphans = next((w["workspace_id"] for w in workspaces() if w.get("label") == ORPHAN_WORKSPACE_LABEL), None)
+    for record in records:
+        agent = find_agent(record["child"], agents)
+        label = record.get("label", record["child"])
+        if orphans is None:
+            moved = herdr("pane", "move", agent["pane_id"], "--new-workspace", "--label", ORPHAN_WORKSPACE_LABEL,
+                          "--tab-label", label, "--no-focus")["result"]
+            orphans = moved["move_result"]["pane"]["workspace_id"]
+        else:
+            moved = herdr("pane", "move", agent["pane_id"], "--new-tab", "--workspace", orphans, "--label", label,
+                          "--no-focus")["result"]
+        pane = moved["move_result"]["pane"]
+        update_record(record["child"], "rehome", state="rehomed", workspace_id=pane["workspace_id"],
+                      tab_id=pane["tab_id"], pane_id=pane["pane_id"])
+    names = ", ".join(r["child"] for r in records)
+    return ("%s was closed with %d live child%s: %s. They now run in the %r workspace with no parent; each still needs "
+            "someone to answer its gates and retire it (/herdr:status flags them as orphans)."
+            % (records[0]["parent"], len(records), "" if len(records) == 1 else "ren", names, ORPHAN_WORKSPACE_LABEL))
+
+
+def close_parent(parent, rehome=False):
+    """Close a parent agent. Refuses while it has live children, unless REHOME moves them to the "Orphaned
+    agents" workspace first; never closes the pane this session runs in or anything else alive."""
+    agents = agent_list()
+    parent_agent = find_agent(parent, agents)
+    if parent_agent is None:
+        raise HerdrError("No agent named %r." % parent)
+    if parent_agent["pane_id"] == os.environ.get("HERDR_PANE_ID"):
+        raise HerdrError("%s runs in this pane, the one this session runs in; close it from another one." % parent)
+    live = [r for r in list_records() if r.get("parent") == parent and r.get("state") == "live"
+            and locate_record(r, agents) is not None]
+    notice = None
+    if live and not rehome:
+        raise HerdrError("%s has live children: %s. Retire or collapse them first, or pass --rehome to move them to the "
+                         "%r workspace." % (parent, ", ".join(r["child"] for r in live), ORPHAN_WORKSPACE_LABEL))
+    if live:
+        notice = rehome_children(live, agents)
+        agents = agent_list()
+        parent_agent = find_agent(parent, agents)
+    argv, blockers = parent_close_command(parent_agent, panes_in(parent_agent["workspace_id"]), agents)
+    if argv is None:
+        raise HerdrError("Not closing %s: its tab holds other live agents or processes:\n%s"
+                         % (parent, "\n".join("- " + b for b in blockers)))
+    herdr(*argv, parse=False)
+    return {"parent": parent, "closed": " ".join(argv), "rehomed": [r["child"] for r in live], "notice": notice}
+
+
+def adopt(parent, name, key=None, topic=None, layout="workspace"):
+    """Write a record for an agent spawned before records existed, so status groups it and consolidate can move it."""
+    if layout not in LAYOUTS:
+        raise HerdrError("The layout must be workspace or shared, not %r." % layout)
+    agents = agent_list()
+    agent = find_agent(name, agents)
+    if agent is None:
+        raise HerdrError("No agent named %r." % name)
+    if not AGENT_NAME.match(parent) or find_agent(parent, agents) is None:
+        raise HerdrError("No agent named %r: --parent must be a running, named agent." % parent)
+    existing = read_record(name)
+    if existing and existing.get("state") == "live":
+        raise HerdrError("%s already has a live record (%s)." % (name, agent_record_path(name)))
+    ws = next((w for w in workspaces() if w["workspace_id"] == agent.get("workspace_id")), {})
+    tree = ws.get("worktree") or {}
+    if tree.get("is_linked_worktree"):
+        worktree, main = tree["checkout_path"], tree["repo_root"]
+    else:
+        code, worktree = git(agent.get("cwd") or ".", "rev-parse", "--show-toplevel")
+        if code != 0:
+            raise HerdrError("%s's folder %s is not in a git checkout; nothing to record." % (name, agent.get("cwd")))
+        main = repo_root(worktree)
+    n = next_child_n(parent, list_records())
+    label = child_label(n, key, topic or ws.get("label", name)) if key else "%d %s" % (n, topic or ws.get("label", name))
+    stamp = now_stamp()
+    return write_record({
+        "child": name, "parent": parent, "n": n, "key": key, "label": label, "layout": layout,
+        "workspace_id": agent.get("workspace_id"), "tab_id": agent.get("tab_id"), "pane_id": agent.get("pane_id"),
+        "worktree": worktree, "branch": git(worktree, "branch", "--show-current")[1] or None, "main_checkout": main,
+        "spawned_at": stamp, "state": "live", "history": [{"at": stamp, "event": "adopted"}]})
+
+
+def consolidate(dry_run=False):
+    """Move each live child that sits outside its parent's workspace back beside it, by its record's layout. A
+    workspace a move empties is removed by Herdr; one still holding panes is kept and listed."""
+    agents = agent_list()
+    labels = {w["workspace_id"]: w.get("label", w["workspace_id"]) for w in workspaces()}
+    moves, skipped = [], []
+    for record in [r for r in list_records() if r.get("state") == "live"]:
+        agent = locate_record(record, agents)
+        parent_agent = find_agent(record.get("parent"), agents)
+        if agent is None or parent_agent is None:
+            skipped.append({"child": record["child"], "reason": "not running" if agent is None else
+                            "its parent %s is not running" % record.get("parent")})
+            continue
+        if agent["workspace_id"] == parent_agent["workspace_id"]:
+            continue
+        moves.append({"child": record["child"], "parent": record["parent"], "from": labels.get(agent["workspace_id"]),
+                      "from_id": agent["workspace_id"], "command": list(pop_in_command(record, agent, parent_agent))})
+    if dry_run:
+        return {"dry_run": True, "moves": [{k: v for k, v in m.items() if k != "from_id"} for m in moves],
+                "skipped": skipped}
+    for move in moves:
+        record_move(move["child"], "consolidate", herdr(*move["command"])["result"])
+    listed = {w["workspace_id"]: w for w in workspaces()}
+    results = []
+    for move in moves:
+        ws = listed.get(move["from_id"])
+        if ws is None:
+            result = "removed by Herdr (empty)"
+        elif not ws.get("pane_count"):
+            herdr("workspace", "close", move["from_id"], parse=False)
+            result = "closed (no panes left)"
+        else:
+            result = "kept: it still holds %d pane%s" % (ws["pane_count"], "" if ws["pane_count"] == 1 else "s")
+        results.append({"workspace": move["from"], "result": result})
+    return {"dry_run": False, "moves": [{k: v for k, v in m.items() if k != "from_id"} for m in moves],
+            "skipped": skipped, "workspaces": results}
+
+
 def open_parent(name, label, cwd, shared_label, kind, prompt, sleep=time.sleep,
                 busy_timeout_seconds=PANE_BUSY_TIMEOUT):
     """Start a parent agent as a tab labelled LABEL in the shared workspace SHARED_LABEL, creating the workspace (and
@@ -2478,6 +2617,18 @@ def main(argv=None):
     for name in ("pop-out", "pop-in", "collapse"):
         sub.add_parser(name).add_argument("child")
     sub.add_parser("retire-close").add_argument("child", metavar="AGENT|WORKSPACE_ID|LABEL")
+    cp = sub.add_parser("close-parent")
+    cp.add_argument("parent")
+    cp.add_argument("--rehome", action="store_true", help="move live children to the %r workspace first"
+                    % ORPHAN_WORKSPACE_LABEL)
+    ad = sub.add_parser("adopt")
+    ad.add_argument("child", metavar="AGENT")
+    ad.add_argument("--parent", required=True)
+    ad.add_argument("--key")
+    ad.add_argument("--topic")
+    ad.add_argument("--layout", choices=LAYOUTS, default="workspace")
+    co = sub.add_parser("consolidate")
+    co.add_argument("--dry-run", action="store_true")
     op = sub.add_parser("open-parent")
     op.add_argument("--name", required=True)
     op.add_argument("--label", required=True)
@@ -2592,6 +2743,12 @@ def main(argv=None):
             action = {"pop-out": pop_out, "pop-in": pop_in, "collapse": collapse,
                       "retire-close": retire_close}[args.command]
             print(json.dumps(action(args.child), indent=2))
+        elif args.command == "close-parent":
+            print(json.dumps(close_parent(args.parent, args.rehome), indent=2))
+        elif args.command == "adopt":
+            print(json.dumps(adopt(args.parent, args.child, args.key, args.topic, args.layout), indent=2))
+        elif args.command == "consolidate":
+            print(json.dumps(consolidate(args.dry_run), indent=2))
         elif args.command == "open-parent":
             print(json.dumps(open_parent(args.name, args.label, args.cwd, args.shared_label, args.kind,
                                          read_prompt(args)), indent=2))
