@@ -10,6 +10,35 @@
       Open WORKTREE as a background workspace, start a named agent in it, stop if a folder-trust prompt shows,
       otherwise send the prompt and confirm the agent started working. Prints a JSON summary. Herdr finds or creates
       the repo's parent workspace. At a trust prompt the prompt is saved for send-prompt.
+  herdr_tools.py launch --path WORKTREE --name CHILD --parent PARENT --key KEY --topic TOPIC [--layout workspace|shared]
+                        [--kind claude] (--prompt TEXT | --prompt-file FILE)
+      Launch a child of a running, named parent agent: workspace layout (the default) opens it as a tab in the
+      parent's workspace labelled "<n> <KEY> <topic>"; shared layout splits the parent's pane. Starts and prompts it as
+      launch does, and writes its record (~/.cache/herdr/agents/CHILD.json).
+  herdr_tools.py next-child-name --parent PARENT --slug SLUG
+      The next child name for a running, named parent: <parent>-<n>-<slug>, n counting up per parent, cut to fit.
+  herdr_tools.py open-parent --name AGENT --label LABEL --cwd DIR --shared-label SHARED [--kind claude]
+                             (--prompt TEXT | --prompt-file FILE)
+      Start a parent agent as a tab labelled LABEL in the shared workspace SHARED (created when missing), for the
+      shared layout. In the workspace layout a parent is whatever workspace it already runs in.
+  herdr_tools.py children PARENT [--json]
+      PARENT's recorded children: where each is (a tab, a pane in the parent's tab, its own workspace, gone), its
+      record state, pane state, status report state and age, and worktree.
+  herdr_tools.py pop-out CHILD | pop-in CHILD
+      Move a child to a workspace of its own, or back beside its parent by its record's layout, keeping its record.
+  herdr_tools.py collapse CHILD
+      Close a finished child's tab (or only its pane, when it shares a tab), keeping its record marked retired. Only
+      when the record is retired, or the child's report says merged with safe_to_retire: yes.
+  herdr_tools.py adopt AGENT --parent PARENT [--key KEY] [--topic TOPIC] [--layout workspace|shared]
+      Write a record for an agent spawned before records existed, so status groups it and consolidate can move it.
+  herdr_tools.py consolidate [--dry-run]
+      Move each live child that sits in a workspace other than its parent's back beside its parent, by its record's
+      layout. Herdr removes a workspace the move empties; one still holding panes is kept and listed. --dry-run only
+      prints the moves.
+  herdr_tools.py close-parent PARENT [--rehome]
+      Close a parent: its workspace when nothing else alive is in it, else (a shared workspace) only its tab. Refuses
+      while it has live children; --rehome first moves them to the "Orphaned agents" workspace and prints a notice for
+      the caller to relay to the owner.
   herdr_tools.py repo-launch --path REPO --key KEY [--branch BRANCH] [--timeout-seconds 120]
       Spawn through the repo's own launcher (its profile's spawn.command, with {key} and {branch} filled in) instead
       of launch, then wait for the agent it starts (spawn.agent). The launcher owns the worktree and the workspace;
@@ -31,7 +60,11 @@
       Create the briefs directory and print the file spawn writes AGENT's brief to.
   herdr_tools.py retire-info AGENT|WORKSPACE_ID|LABEL
       JSON for /herdr:retire: workspace, worktree, main checkout, branch, MR (the worktree branch's, else the one the
-      agent's status report names, in any repo), the agent's parsed status report, and every retire check.
+      agent's status report names, in any repo), the agent's parsed status report, how retire-close will close it
+      and what would block that, and every retire check. A recorded child's worktree comes from its record.
+  herdr_tools.py retire-close AGENT|WORKSPACE_ID|LABEL
+      The one way retire closes an agent: a recorded child's tab or pane (never the workspace it shares), its record
+      marked retired; any other agent's workspace only when no other agent or non-shell process is in it.
   herdr_tools.py land [AGENT|WORKSPACE_ID|LABEL] [--mr URL|GROUP/PROJECT!IID] [--timeout-minutes 30]
       Merge the agent's validated MR (its worktree branch's, else the one its status report names), or the MR --mr
       names in any repo: rebase if behind, wait for the head pipeline, squash-merge pinned to that commit. Stops on a

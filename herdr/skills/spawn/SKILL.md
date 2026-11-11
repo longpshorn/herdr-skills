@@ -14,6 +14,7 @@ Helper: `sh "${CLAUDE_PLUGIN_ROOT}/scripts/herdr-tools"`, written `herdr_tools.p
   - `tracker.kind == jira`: read the ticket (`acli jira workitem view KEY`).
   - Branch: with `tracker.branch_command`, run it with `{type}` and `{key}` filled in and the ticket title on stdin, and read `.branch` from its JSON. Otherwise a short `<type>/<KEY-or-topic>-<desc>` branch (conventional-commit type, hyphen-case).
 - **Names:** workspace label `<KEY or topic> <two-word topic>` (e.g. `PROJ-105 language`); agent name the key lower-cased without the dash (`proj105`), or a short topic, matching `[a-z][a-z0-9_-]{0,31}`. Check `herdr_tools.py status` so the name is not already taken.
+- **From a parent agent:** when the spawning session is itself an agent that will answer the child's gates (a parent), or the user names one, the child is that parent's: name it with `herdr_tools.py next-child-name --parent <parent> --slug <two-word topic>` (`<parent>-<n>-<slug>`; the ticket goes in the tab label, not the name). The parent must be a running, named agent. Pick the layout: `workspace` (the default: the child is a tab in the parent's workspace) or `shared` (a split pane in the parent's tab), as the caller or user asks.
 - **Kind:** `claude` unless the user asks for another of the kinds `herdr agent` lists (such as `codex`, `gemini`, `opencode` or `omp`). An agent of another kind reads the brief the same way; it needs the herdr skills installed for its tool only if it will run them itself (README, "Other coding agents").
 - **Shared concepts, across a batch:** list the concepts each ticket will define or change (rules, thresholds, mappings, value sets, vocabularies other code must agree with) and find their current owners in the code. Agents in parallel worktrees can't see each other, so a concept touched by two tickets gets one owner ticket. The others reuse its definition, landing after it or rebasing onto it. Say which in each brief.
 
@@ -51,9 +52,18 @@ herdr_tools.py launch --path <worktree> --label "<label>" --name <agent> \
 
 It opens the worktree as a background workspace (Herdr reuses the repo's parent workspace on its main checkout, or creates one), starts the agent, and sends the prompt. A new workspace's shell can take a few seconds to come up; launch retries `herdr agent start` until it is ready (up to 30s) and otherwise fails with a message naming the command to run by hand. Read its JSON:
 
+For a parent's child, launch it beside the parent instead; it takes no `--label` (the tab is labelled `<n> <KEY> <topic>`) and writes the child's record, which `/herdr:status`, `children`, `pop-out`, `pop-in`, `collapse` and `/herdr:retire` read:
+
+```bash
+herdr_tools.py launch --path "<worktree>" --name <child> --parent <parent> --key <KEY> --topic "<topic>" \
+  [--layout shared] --prompt "<the same prompt>"
+```
+
+Fill the brief's `parent:` line with the parent's name (else `none`), and say in the brief that the parent answers the child's gates. In the shared layout a parent itself is started with `herdr_tools.py open-parent --name <parent> --label "<label>" --cwd "<dir>" --shared-label "<shared workspace>" --prompt "..."`, which opens it as a tab in that workspace (created when missing).
+
 - `trust_prompt: true` — the agent is at its folder-trust prompt, and launch saved the prompt instead of sending it. Never answer the trust prompt for the user. Tell them which workspace to open, then run `herdr_tools.py send-prompt --name <agent>` in the background (Claude Code: `run_in_background`; elsewhere a background shell job, or a sibling pane with `/herdr:run`, whose output you read when it ends): it waits up to 10 minutes for them to answer, sends the saved prompt and confirms the agent is working. If it times out, re-run it once they have answered.
 - `status: working` (or `idle` with `prompted: true`, a prompt it already finished) — done. `status: blocked` soon after is usually the agent's own question; `/herdr:peek` it.
 
 ## 5. Report
 
-Workspace label, agent name, worktree path, branch, brief path, status report path, and what the agent will stop for (its plan gate). The user keeps focus; never focus the new workspace unless asked.
+Workspace label (or, for a child, its parent and tab label), agent name, worktree path, branch, brief path, status report path, and what the agent will stop for (its plan gate, presented as text). The user keeps focus; never focus the new workspace unless asked.
