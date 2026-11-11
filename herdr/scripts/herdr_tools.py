@@ -154,6 +154,81 @@ def brief_path(agent, home=None):
     return os.path.join(home or os.path.expanduser("~"), ".cache", "herdr", "briefs", agent + ".md")
 
 
+# ---- Child records: which agent a parent spawned, and where it sits ------------------------------------------------
+# One JSON file per child under ~/.cache/herdr/agents/, the only owner of this concept: Herdr keeps no durable per-pane
+# metadata and reports worktrees per workspace, never per tab or pane. Every reader goes through these functions.
+
+AGENT_NAME = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
+AGENT_NAME_MAX = 32
+RECORD_STATES = ("live", "retired", "rehomed")
+LAYOUTS = ("workspace", "shared")
+ORPHAN_WORKSPACE_LABEL = "Orphaned agents"
+
+
+def now_stamp():
+    return time.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def agent_record_path(child, home=None):
+    return os.path.join(home or os.path.expanduser("~"), ".cache", "herdr", "agents", child + ".json")
+
+
+def read_record(child):
+    record = read_json_or_none(agent_record_path(child))
+    return record if isinstance(record, dict) else None
+
+
+def write_record(record):
+    path = agent_record_path(record["child"])
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(record, handle, indent=2)
+    return record
+
+
+def update_record(child, event, now=None, **changes):
+    """Change a record's fields and append the event, with what it changed, to its history."""
+    record = read_record(child)
+    if record is None:
+        raise HerdrError("No record for %s in %s." % (child, os.path.dirname(agent_record_path(child))))
+    record.update(changes)
+    record.setdefault("history", []).append(dict({"at": now or now_stamp(), "event": event}, **changes))
+    return write_record(record)
+
+
+def list_records():
+    folder = os.path.dirname(agent_record_path("x"))
+    if not os.path.isdir(folder):
+        return []
+    records = [read_record(name[:-5]) for name in os.listdir(folder) if name.endswith(".json")]
+    return sorted((r for r in records if r and r.get("child")), key=lambda r: (r.get("parent", ""), r.get("n", 0)))
+
+
+def child_label(n, key, topic):
+    """A child's tab label (and its workspace label when popped out): `<n> <KEY> <topic>`."""
+    return "%d %s %s" % (n, key, topic)
+
+
+def next_child_n(parent, records):
+    return 1 + max([r.get("n", 0) for r in records if r.get("parent") == parent] or [0])
+
+
+def next_child_name(parent, slug, records):
+    """`<parent>-<n>-<slug>`, n counting up per parent, the slug cut so the whole is a Herdr agent name."""
+    if not AGENT_NAME.match(parent):
+        raise HerdrError("The parent %r must be a named agent (a name like irt-102, not a pane id), so its children's "
+                         "records survive pane renumbering." % parent)
+    slug = re.sub(r"[^a-z0-9_-]+", "-", slug.lower()).strip("-_")
+    if not slug:
+        raise HerdrError("The slug %r has no letters or digits to name the child by." % slug)
+    prefix = "%s-%d-" % (parent, next_child_n(parent, records))
+    room = AGENT_NAME_MAX - len(prefix)
+    if room < 1:
+        raise HerdrError("The parent name %r is too long to leave room for a child's number and slug (%d characters "
+                         "at most in all)." % (parent, AGENT_NAME_MAX))
+    return prefix + (slug[:room].rstrip("-_") or slug[0])
+
+
 def parse_status_report(text):
     """A report is a `---` header of `key: value` lines, then `## Section` blocks. None if the header is missing."""
     match = re.match(r"\A---\n(.*?)\n---\n?(.*)\Z", text, re.DOTALL)
@@ -1575,7 +1650,7 @@ def repo_launch(main_checkout, profile, values, runner=subprocess.run, sleep=tim
                          "or '#', starting with a letter, digit or '#' (so it can't read as an option)." % key)
     argv = fill_command(spawn["command"], values)
     name = PLACEHOLDER.sub(lambda m: str(values.get(m.group(1), m.group(0))), spawn["agent"])
-    if not re.match(r"^[a-z][a-z0-9_-]{0,31}$", name):
+    if not AGENT_NAME.match(name):
         raise HerdrError("spawn.agent resolved to %r, which is not a Herdr agent name." % name)
     try:
         proc = runner(argv, capture_output=True, text=True, cwd=main_checkout, timeout=launcher_timeout_seconds)

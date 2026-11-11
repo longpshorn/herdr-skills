@@ -2652,3 +2652,89 @@ class RebaseRequestIsDelivered(unittest.TestCase):
             ht.deliver = saved
         self.assertEqual(calls, [("proj105", {"text": ht.REBASE_REQUEST, "topic": "rebase request",
                                               "timeout_seconds": 120})])
+
+
+# ---- Parents and children ----------------------------------------------------------------------------------------
+
+
+class HomeTest(unittest.TestCase):
+    """Points the home directory at a temporary one, so records and reports land there."""
+
+    def setUp(self):
+        self.home = tempfile.mkdtemp()
+        self.saved_home = point_home_at(self.home)
+
+    def tearDown(self):
+        restore_home(self.saved_home)
+        shutil.rmtree(self.home)
+
+
+def child_record(child="irt-102-1-dedupe", parent="irt-102", n=1, **fields):
+    record = {"child": child, "parent": parent, "n": n, "key": "PROJ-1", "label": "%d PROJ-1 dedupe" % n,
+              "layout": "workspace", "workspace_id": "wP", "tab_id": "wP:t2", "pane_id": "wP:p2",
+              "worktree": "/code/repo-PROJ-1", "branch": "fix/PROJ-1-dedupe", "main_checkout": REPO,
+              "spawned_at": "2026-11-11T13:00:00", "state": "live", "history": []}
+    record.update(fields)
+    return record
+
+
+class ChildRecords(HomeTest):
+    def test_a_record_lives_in_the_herdr_agents_cache_named_after_the_child(self):
+        self.assertEqual(ht.agent_record_path("irt-102-1-dedupe"),
+                         os.path.join(self.home, ".cache", "herdr", "agents", "irt-102-1-dedupe.json"))
+
+    def test_written_records_read_back_and_a_missing_one_is_none(self):
+        ht.write_record(child_record())
+        self.assertEqual(ht.read_record("irt-102-1-dedupe"), child_record())
+        self.assertIsNone(ht.read_record("nobody"))
+
+    def test_an_update_changes_fields_and_appends_what_happened_to_the_history(self):
+        ht.write_record(child_record())
+        ht.update_record("irt-102-1-dedupe", "pop-out", now="2026-11-11T14:00:00", workspace_id="wX", pane_id="wX:p1")
+        record = ht.read_record("irt-102-1-dedupe")
+        self.assertEqual((record["workspace_id"], record["pane_id"]), ("wX", "wX:p1"))
+        self.assertEqual(record["history"], [{"at": "2026-11-11T14:00:00", "event": "pop-out",
+                                              "workspace_id": "wX", "pane_id": "wX:p1"}])
+
+    def test_updating_a_child_without_a_record_says_so(self):
+        with self.assertRaisesRegex(ht.HerdrError, "No record for nobody"):
+            ht.update_record("nobody", "pop-out")
+
+    def test_lists_every_record_and_skips_unreadable_files(self):
+        ht.write_record(child_record("p-2-b", "p", 2))
+        ht.write_record(child_record("p-1-a", "p", 1))
+        with open(os.path.join(os.path.dirname(ht.agent_record_path("x")), "broken.json"), "w") as handle:
+            handle.write("{")
+        self.assertEqual([r["child"] for r in ht.list_records()], ["p-1-a", "p-2-b"])
+
+    def test_no_records_folder_means_no_records(self):
+        self.assertEqual(ht.list_records(), [])
+
+
+class ChildNames(unittest.TestCase):
+    def test_counts_up_per_parent(self):
+        records = [child_record("p-1-a", "p", 1), child_record("p-3-c", "p", 3), child_record("q-7-x", "q", 7)]
+        self.assertEqual(ht.next_child_name("p", "Dedupe rows", records), "p-4-dedupe-rows")
+        self.assertEqual(ht.next_child_name("r", "x", records), "r-1-x")
+
+    def test_cuts_the_slug_so_the_name_is_a_herdr_agent_name(self):
+        name = ht.next_child_name("ipt-core801", "a very long slug that goes on and on", [])
+        self.assertEqual(len(name), 32)
+        self.assertTrue(ht.AGENT_NAME.match(name))
+        self.assertTrue(name.startswith("ipt-core801-1-a-very-long-slug"))
+        self.assertFalse(name.endswith("-"))
+
+    def test_refuses_a_parent_that_is_not_an_agent_name(self):
+        with self.assertRaisesRegex(ht.HerdrError, "named agent"):
+            ht.next_child_name("w8Y:p1", "x", [])
+
+    def test_refuses_a_parent_name_that_leaves_no_room_for_a_slug(self):
+        with self.assertRaisesRegex(ht.HerdrError, "too long"):
+            ht.next_child_name("p" * 29, "x", [])
+
+    def test_refuses_a_slug_with_nothing_usable(self):
+        with self.assertRaisesRegex(ht.HerdrError, "slug"):
+            ht.next_child_name("p", "!!!", [])
+
+    def test_the_tab_label_carries_number_key_and_topic(self):
+        self.assertEqual(ht.child_label(3, "PROJ-9", "dedupe rows"), "3 PROJ-9 dedupe rows")
