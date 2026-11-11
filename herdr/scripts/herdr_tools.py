@@ -876,6 +876,60 @@ def find_retire_target(workspaces, agents, target, own_workspace):
     return ws
 
 
+def close_blockers(panes, agents, process_infos, keep):
+    """What `herdr workspace close` (or a tab close) would kill beyond the panes in KEEP: every other pane hosting an
+    agent, and every other pane whose foreground process is not its shell. An idle shell is not a blocker."""
+    by_pane = {a.get("pane_id"): a for a in agents}
+    blockers = []
+    for pane in panes:
+        pane_id = pane["pane_id"]
+        if pane_id in keep:
+            continue
+        agent = by_pane.get(pane_id)
+        if agent:
+            blockers.append("agent %s (%s) in %s" % (agent.get("name") or pane_id, agent.get("agent_status") or "unknown",
+                                                      pane_id))
+            continue
+        info = process_infos.get(pane_id) or {}
+        busy = [p for p in info.get("foreground_processes") or [] if p.get("pid") != info.get("shell_pid")]
+        if busy:
+            blockers.append("process `%s` in %s" % (busy[0].get("cmdline") or busy[0].get("name"), pane_id))
+    return blockers
+
+
+def same_path(a, b):
+    return bool(a) and bool(b) and os.path.normcase(os.path.realpath(a)) == os.path.normcase(os.path.realpath(b))
+
+
+def child_retire_target(record, agents, own_pane):
+    """A recorded child's retire target: Herdr reports worktrees per workspace, never per tab or pane, so the worktree
+    comes from the record, checked with git. Refuses the pane this session runs in, and a main checkout."""
+    agent = locate_record(record, agents)
+    if agent and agent.get("pane_id") == own_pane:
+        raise HerdrError("%s runs in this pane, the one this session runs in; retire it from another one."
+                         % record["child"])
+    path, main = record.get("worktree"), record.get("main_checkout")
+    if same_path(path, main):
+        raise HerdrError("%s's record names the repo's main checkout %s; only linked worktrees are retired."
+                         % (record["child"], path))
+    if path and os.path.isdir(path):
+        code, top = git(path, "rev-parse", "--show-toplevel")
+        if code != 0 or not same_path(top, path):
+            raise HerdrError("%s's record names the worktree %s, but git says %s. Check the record at %s."
+                             % (record["child"], path, top if code == 0 else "it is not a git checkout",
+                                agent_record_path(record["child"])))
+    return {"workspace_id": agent["workspace_id"] if agent else record.get("workspace_id"), "label": record.get("label"),
+            "worktree": {"checkout_path": path, "repo_root": main, "is_linked_worktree": True}}
+
+
+def retire_target(target, agents, workspace_list, own_workspace, own_pane):
+    """(workspace-like dict, record): a recorded child by its record; anything else as find_retire_target finds it."""
+    record = read_record(target) if AGENT_NAME.match(target or "") else None
+    if record is None:
+        return find_retire_target(workspace_list, agents, target, own_workspace), None
+    return child_retire_target(record, agents, own_pane), record
+
+
 # ---- herdr / git I/O ---------------------------------------------------------------------------------------------
 
 
@@ -1188,12 +1242,65 @@ def work_tools_path(plugins_dir=None, skill_folders=None):
     return None
 
 
+def find_target(target, agents):
+    """(workspace-like dict, record) for TARGET, refusing this session's own workspace or pane."""
+    return retire_target(target, agents, workspaces(), os.environ.get("HERDR_WORKSPACE_ID"),
+                         os.environ.get("HERDR_PANE_ID"))
+
+
+def target_agent(target, ws, record, agents):
+    """The agent being retired: the child a record names, the agent TARGET names, else the workspace's first agent."""
+    if record is not None:
+        return find_agent(record["child"], agents)
+    return find_agent(target, agents) or next((a for a in agents if a.get("workspace_id") == ws["workspace_id"]), None)
+
+
+def process_info(pane):
+    return herdr("pane", "process-info", "--pane", pane)["result"]["process_info"]
+
+
+def close_plan(target, agents=None):
+    """How retire closes TARGET, before anything closes: a child's tab or pane, or the agent's whole workspace, with
+    whatever else that workspace holds that the close would kill (the blockers)."""
+    agents = agent_list() if agents is None else agents
+    ws, record = find_target(target, agents)
+    if record is not None:
+        panes = herdr("pane", "list")["result"]["panes"]
+        pane = child_pane(record, agents, panes)
+        argv = close_child_command(pane, panes) if pane else None
+        return {"action": " ".join(argv[:2]) if argv else None, "target": argv[2] if argv else None, "blockers": [],
+                "record": record}
+    agent = target_agent(target, ws, None, agents)
+    keep = {agent["pane_id"]} if agent else set()
+    panes = herdr("pane", "list", "--workspace", ws["workspace_id"])["result"]["panes"]
+    hosted = {a.get("pane_id") for a in agents}
+    infos = {p["pane_id"]: process_info(p["pane_id"]) for p in panes
+             if p["pane_id"] not in keep and p["pane_id"] not in hosted}
+    return {"action": "workspace close", "target": ws["workspace_id"], "label": ws.get("label"),
+            "blockers": close_blockers(panes, agents, infos, keep), "record": None}
+
+
+def retire_close(target):
+    """The one way retire closes an agent: a recorded child's tab or pane (its record marked retired), never the
+    workspace it shares; any other agent's workspace only when nothing else alive is in it."""
+    agents = agent_list()
+    plan = close_plan(target, agents)
+    if plan["record"] is not None:
+        return close_child(plan["record"], "retire", agents)
+    if plan["blockers"]:
+        raise HerdrError("Not closing workspace %r (%s): it holds other live agents or processes, which `herdr "
+                         "workspace close` would kill:\n%s" % (plan.get("label"), plan["target"],
+                                                                "\n".join("- " + b for b in plan["blockers"])))
+    herdr("workspace", "close", plan["target"], parse=False)
+    return {"agent": target, "closed": "workspace close " + plan["target"]}
+
+
 def retire_info(target):
     """Everything /herdr:retire needs to decide, as one JSON-ready dict."""
     agents = herdr("agent", "list")["result"]["agents"]
-    ws = find_retire_target(workspaces(), agents, target, os.environ.get("HERDR_WORKSPACE_ID"))
+    ws, record = find_target(target, agents)
     path = ws["worktree"]["checkout_path"]
-    agent = next((a for a in agents if a.get("workspace_id") == ws["workspace_id"]), None)
+    agent = target_agent(target, ws, record, agents)
     name = agent.get("name") if agent else None
     report_path, report = read_report(name)
     reported_branch = report["fields"].get("branch", "") if report else ""
@@ -1224,6 +1331,16 @@ def retire_info(target):
                 git(main_checkout, "fetch", "-q", "origin", merged)
             branch_patch, merged_patch = branch_patch_id(path, default), commit_patch_id(path, merged)
         head_landed = head_landed_how(head, (mr or {}).get("sha"), on_default, branch_patch, merged_patch)
+    close = dict(close_plan(target, agents), record=agent_record_path(record["child"]) if record else None)
+    checks = retire_checks(
+        agent.get("agent_status", "unknown") if agent else "gone",
+        porcelain, mr["state"] if mr else None, head_landed, report, worktree_removed=removed, approval=approval,
+        land_mode=profile["retire"]["land"], report_expected=profile["spawn"]["brief"],
+    )
+    checks.append({"check": "close", "ok": not close["blockers"], "detail": (
+        "%s %s" % (close["action"], close["target"]) if close["action"] else "nothing left to close"
+    ) if not close["blockers"] else "the workspace holds other live agents or processes:\n" + "\n".join(
+        close["blockers"])})
     return {
         "profile": profile["name"] or "(defaults)",
         "forge": profile["forge"],
@@ -1244,11 +1361,9 @@ def retire_info(target):
         "branch_cleanup": profile["retire"]["branch_cleanup"],
         "worktree_remove": profile["worktree"].get("remove"),
         "work_tools": work_tools_path(),
-        "checks": retire_checks(
-            agent.get("agent_status", "unknown") if agent else "gone",
-            porcelain, mr["state"] if mr else None, head_landed, report, worktree_removed=removed, approval=approval,
-            land_mode=profile["retire"]["land"], report_expected=profile["spawn"]["brief"],
-        ),
+        "parent": record.get("parent") if record else None,
+        "close": close,
+        "checks": checks,
     }
 
 
@@ -1290,8 +1405,7 @@ def land_loop(forge, iid, timeout_seconds, poll_seconds=20, sleep=time.sleep, ma
 
 def agent_profile(target):
     """The resolved profile of the repo an agent's worktree belongs to (the agent named as retire-info takes it)."""
-    agents = herdr("agent", "list")["result"]["agents"]
-    ws = find_retire_target(workspaces(), agents, target, os.environ.get("HERDR_WORKSPACE_ID"))
+    ws = find_target(target, agent_list())[0]
     path = ws["worktree"]["checkout_path"]
     return project_profile(repo_root(path) if os.path.isdir(path) else ws["worktree"]["repo_root"])
 
@@ -2363,6 +2477,7 @@ def main(argv=None):
     ch.add_argument("--json", action="store_true")
     for name in ("pop-out", "pop-in", "collapse"):
         sub.add_parser(name).add_argument("child")
+    sub.add_parser("retire-close").add_argument("child", metavar="AGENT|WORKSPACE_ID|LABEL")
     op = sub.add_parser("open-parent")
     op.add_argument("--name", required=True)
     op.add_argument("--label", required=True)
@@ -2473,8 +2588,9 @@ def main(argv=None):
         elif args.command == "children":
             rows = children(args.parent)
             print(json.dumps(rows, indent=2) if args.json else format_children(rows))
-        elif args.command in ("pop-out", "pop-in", "collapse"):
-            action = {"pop-out": pop_out, "pop-in": pop_in, "collapse": collapse}[args.command]
+        elif args.command in ("pop-out", "pop-in", "collapse", "retire-close"):
+            action = {"pop-out": pop_out, "pop-in": pop_in, "collapse": collapse,
+                      "retire-close": retire_close}[args.command]
             print(json.dumps(action(args.child), indent=2))
         elif args.command == "open-parent":
             print(json.dumps(open_parent(args.name, args.label, args.cwd, args.shared_label, args.kind,

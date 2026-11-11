@@ -3021,8 +3021,8 @@ class OpenParent(LayoutTest):
         self.assertEqual(self.fake.agent_named("irt-200")["workspace_id"], ws)
 
 
-class LayoutCli(LayoutTest):
-    """The CLI commands for parents and children, run through main() inside a pretend Herdr pane."""
+class CliTest(LayoutTest):
+    """Runs the CLI through main() inside a pretend Herdr pane."""
 
     def setUp(self):
         super().setUp()
@@ -3037,6 +3037,8 @@ class LayoutCli(LayoutTest):
             code = ht.main(list(argv))
         return code, out.getvalue(), err.getvalue()
 
+
+class LayoutCli(CliTest):
     def test_next_child_name_counts_from_the_parents_records(self):
         ht.write_record(child_record())
         self.assertEqual(self.run_main("next-child-name", "--parent", "irt-102", "--slug", "Retry jobs")[:2],
@@ -3192,7 +3194,7 @@ def time_now():
     return time.time()
 
 
-class ChildMovesCli(LayoutCli):
+class ChildMovesCli(CliTest):
     def test_children_prints_a_table_or_json(self):
         self.launch_child()
         code, out, _ = self.run_main("children", "irt-102")
@@ -3208,3 +3210,157 @@ class ChildMovesCli(LayoutCli):
         code, _, err = self.run_main("collapse", "irt-102-1-dedupe")
         self.assertEqual(code, 1)
         self.assertIn("not finished", err)
+
+
+class CloseBlockers(unittest.TestCase):
+    def test_lists_every_other_agent_and_every_pane_running_more_than_its_shell(self):
+        panes = [{"pane_id": "w1:p1"}, {"pane_id": "w1:p2"}, {"pane_id": "w1:p3"}, {"pane_id": "w1:p4"}]
+        agents = [{"name": "me", "pane_id": "w1:p1", "agent_status": "idle"},
+                  {"name": "sibling", "pane_id": "w1:p2", "agent_status": "working"}]
+        shell = {"shell_pid": 1, "foreground_processes": [{"pid": 1, "cmdline": "-zsh"}]}
+        server = {"shell_pid": 1, "foreground_processes": [{"pid": 7, "cmdline": "npm run dev"}]}
+        procs = {"w1:p1": shell, "w1:p2": shell, "w1:p3": server, "w1:p4": shell}
+        self.assertEqual(ht.close_blockers(panes, agents, procs, keep={"w1:p1"}),
+                         ["agent sibling (working) in w1:p2", "process `npm run dev` in w1:p3"])
+
+
+def linked(path):
+    return {"repo_root": REPO, "checkout_path": path, "is_linked_worktree": True}
+
+
+class RetireTarget(LayoutTest):
+    def setUp(self):
+        super().setUp()
+        self.worktree = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.worktree)
+        self.toplevel = self.worktree
+        ht.git = lambda path, *args: (0, self.toplevel) if args == ("rev-parse", "--show-toplevel") else (0, "")
+
+    def child(self, **fields):
+        tab = self.fake.add_tab(self.parent_ws, "1 PROJ-1 dedupe")
+        pane = self.fake.add_pane(tab, self.worktree)
+        self.fake.add_agent("irt-102-1-dedupe", pane)
+        ht.write_record(child_record(worktree=self.worktree, **fields))
+        return pane
+
+    def target(self, name="irt-102-1-dedupe", own_pane="w9:p9"):
+        return ht.retire_target(name, self.fake.agent_rows(), [self.fake.ws_row(w) for w in self.fake.workspaces],
+                                own_workspace=self.parent_ws, own_pane=own_pane)
+
+    def test_a_recorded_childs_worktree_comes_from_its_record_checked_with_git(self):
+        self.child()
+        ws, record = self.target()
+        self.assertEqual(record["child"], "irt-102-1-dedupe")
+        self.assertEqual((ws["workspace_id"], ws["label"]), (self.parent_ws, "1 PROJ-1 dedupe"))
+        self.assertEqual(ws["worktree"], {"checkout_path": self.worktree, "repo_root": REPO, "is_linked_worktree": True})
+
+    def test_refuses_when_git_disagrees_with_the_record(self):
+        self.child()
+        self.toplevel = "/somewhere/else"
+        with self.assertRaisesRegex(ht.HerdrError, "git says"):
+            self.target()
+
+    def test_refuses_a_record_pointing_at_the_main_checkout(self):
+        self.child(main_checkout=self.worktree)
+        with self.assertRaisesRegex(ht.HerdrError, "main checkout"):
+            self.target()
+
+    def test_refuses_the_childs_own_pane_but_not_the_workspace_it_shares_with_this_session(self):
+        pane = self.child()
+        self.assertEqual(self.target(own_pane="w9:p9")[1]["child"], "irt-102-1-dedupe")
+        with self.assertRaisesRegex(ht.HerdrError, "this session"):
+            self.target(own_pane=pane)
+
+    def test_an_agent_without_a_record_takes_the_one_workspace_path_unchanged(self):
+        self.fake.add_workspace("PROJ-9 x", worktree=linked("/code/repo-PROJ-9"))
+        pane = [p for p, row in self.fake.panes.items() if row["workspace_id"] == "w2"][0]
+        self.fake.add_agent("proj9", pane)
+        ws, record = self.target("proj9")
+        self.assertEqual((ws["workspace_id"], record), ("w2", None))
+
+
+class RetireClose(LayoutTest):
+    def test_a_child_closes_only_its_tab_and_is_marked_retired(self):
+        self.launch_child()
+        tab = self.fake.agent_named("irt-102-1-dedupe")["tab_id"]
+        ht.retire_close("irt-102-1-dedupe")
+        self.assertEqual(self.fake.called("tab", "close"), [("tab", "close", tab)])
+        self.assertEqual(self.fake.called("workspace", "close"), [])
+        self.assertIn("irt-102", self.fake.agents)
+        self.assertEqual(ht.read_record("irt-102-1-dedupe")["state"], "retired")
+
+    def agent_workspace(self):
+        ws, tab, pane = self.fake.add_workspace("PROJ-9 x", worktree=linked("/code/repo-PROJ-9"))
+        self.fake.add_agent("proj9", pane)
+        return ws, tab
+
+    def test_refuses_a_workspace_holding_another_agent_and_lists_it(self):
+        ws, tab = self.agent_workspace()
+        self.fake.add_agent("helper", self.fake.add_pane(tab))
+        with self.assertRaisesRegex(ht.HerdrError, r"(?s)other live agents or processes.*agent helper \(idle\)"):
+            ht.retire_close("proj9")
+        self.assertEqual(self.fake.called("workspace", "close"), [])
+
+    def test_refuses_a_workspace_with_a_pane_running_a_process(self):
+        ws, _ = self.agent_workspace()
+        busy = self.fake.add_pane(self.fake.add_tab(ws, "server"))
+        self.fake.busy[busy] = "npm run dev"
+        with self.assertRaisesRegex(ht.HerdrError, "process `npm run dev`"):
+            ht.retire_close("proj9")
+        self.assertIn(ws, self.fake.workspaces)
+
+    def test_closes_a_workspace_holding_only_the_agent_and_idle_shells(self):
+        ws, tab = self.agent_workspace()
+        self.fake.add_pane(tab)
+        ht.retire_close("proj9")
+        self.assertEqual(self.fake.called("workspace", "close"), [("workspace", "close", ws)])
+
+    def test_the_close_plan_shows_the_action_and_its_blockers_before_anything_closes(self):
+        ws, tab = self.agent_workspace()
+        self.fake.add_agent("helper", self.fake.add_pane(tab))
+        plan = ht.close_plan("proj9")
+        self.assertEqual((plan["action"], plan["target"]), ("workspace close", ws))
+        self.assertEqual(plan["blockers"], ["agent helper (idle) in %s:p2" % ws])
+        self.launch_child()
+        plan = ht.close_plan("irt-102-1-dedupe")
+        self.assertEqual((plan["action"], plan["blockers"]), ("tab close", []))
+
+
+class RetireInfoForAChild(LayoutTest):
+    def setUp(self):
+        super().setUp()
+        self.worktree = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.worktree)
+        answers = {("rev-parse", "--show-toplevel"): self.worktree, ("branch", "--show-current"): "fix/PROJ-1-dedupe",
+                   ("rev-parse", "HEAD"): "abc", ("status", "--porcelain"): ""}
+        ht.git = lambda path, *args: (0, answers.get(args, ""))
+        saved = ht.project_profile, ht.forge_for, ht.work_tools_path
+        self.addCleanup(lambda: setattr(ht, "project_profile", saved[0]) or setattr(ht, "forge_for", saved[1])
+                        or setattr(ht, "work_tools_path", saved[2]))
+        ht.project_profile = lambda main: dict(ht.resolve_profile(None, "git@github.com:acme/repo.git"),
+                                               main_checkout=main, remote="", sources={})
+        ht.forge_for = lambda profile: FakeViewForge()
+        ht.work_tools_path = lambda: None
+
+    def test_a_childs_worktree_agent_and_close_come_from_its_record_never_the_shared_workspace(self):
+        tab = self.fake.add_tab(self.parent_ws, "1 PROJ-1 dedupe")
+        self.fake.add_agent("irt-102-1-dedupe", self.fake.add_pane(tab, self.worktree))
+        ht.write_record(child_record(worktree=self.worktree))
+        info = ht.retire_info("irt-102-1-dedupe")
+        self.assertEqual((info["agent"], info["worktree"], info["main_checkout"], info["parent"]),
+                         ("irt-102-1-dedupe", self.worktree, REPO, "irt-102"))
+        self.assertEqual((info["close"]["action"], info["close"]["target"]), ("tab close", tab))
+        self.assertEqual(info["close"]["record"], ht.agent_record_path("irt-102-1-dedupe"))
+        self.assertTrue(checks_by_name(info["checks"])["close"]["ok"])
+
+
+class RetireCloseCli(CliTest):
+    def test_retire_close_closes_a_childs_tab_and_refuses_a_shared_workspace_with_the_blockers(self):
+        self.launch_child()
+        self.assertEqual(self.run_main("retire-close", "irt-102-1-dedupe")[0], 0)
+        ws, tab, pane = self.fake.add_workspace("PROJ-9 x", worktree=linked("/code/repo-PROJ-9"))
+        self.fake.add_agent("proj9", pane)
+        self.fake.add_agent("helper", self.fake.add_pane(tab))
+        code, _, err = self.run_main("retire-close", "proj9")
+        self.assertEqual(code, 1)
+        self.assertIn("agent helper (idle)", err)
