@@ -108,7 +108,10 @@ def find_parent_workspace(workspaces, repo_root, panes=()):
     return None
 
 
-def status_rows(workspaces, agents):
+def status_rows(workspaces, agents, records=()):
+    """Every agent, the ones needing attention first. A running child with a live or rehomed record follows its parent
+    (with `parent` set); one whose parent is not running stays in place, flagged `orphan`. Agents without records
+    keep exactly the rows they always had."""
     labels = {ws["workspace_id"]: ws.get("label", ws["workspace_id"]) for ws in workspaces}
     rows = [
         {
@@ -120,12 +123,34 @@ def status_rows(workspaces, agents):
         }
         for a in agents
     ]
-    return sorted(rows, key=lambda r: (ATTENTION_ORDER.get(r["status"], 9), r["workspace"].lower()))
+    rows = sorted(rows, key=lambda r: (ATTENTION_ORDER.get(r["status"], 9), r["workspace"].lower()))
+    names = {r["target"] for r in rows}
+    parents = {r["child"]: r.get("parent") for r in records
+               if r.get("state") in ("live", "rehomed") and r.get("child") in names}
+    if not parents:
+        return rows
+    grouped = []
+
+    def add(row, depth):
+        grouped.append(row)
+        for child in [r for r in rows if parents.get(r["target"]) == row["target"]]:
+            add(dict(child, parent=row["target"], depth=depth + 1), depth + 1)
+
+    for row in rows:
+        parent = parents.get(row["target"])
+        if parent is None:
+            add(row, 0)
+        elif parent not in names:
+            add(dict(row, parent=parent, orphan=True), 0)
+    return grouped
 
 
 def format_status(rows):
     if not rows:
         return "No agents are running."
+    rows = [dict(r, target="  " * r.get("depth", 0) + r["target"],
+                 title=("orphan of %s: %s" % (r["parent"], r["title"])) if r.get("orphan") else r["title"])
+            for r in rows]
     cols = [("STATUS", "status"), ("AGENT", "target"), ("KIND", "kind"), ("WORKSPACE", "workspace"), ("TITLE", "title")]
     widths = [max(len(head), *(len(r[key]) for r in rows)) for head, key in cols[:-1]]
     def line(values):
@@ -2718,8 +2743,7 @@ def main(argv=None):
         return 2
     try:
         if args.command == "status":
-            agents = herdr("agent", "list")["result"]["agents"]
-            print(format_status(status_rows(workspaces(), agents)))
+            print(format_status(status_rows(workspaces(), agent_list(), list_records())))
         elif args.command == "parent-workspace":
             ws = parent_workspace(args.path, args.create, args.wait_seconds)
             print(json.dumps({"workspace_id": ws["workspace_id"], "label": ws.get("label")}))

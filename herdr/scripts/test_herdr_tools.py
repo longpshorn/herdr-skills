@@ -3524,3 +3524,60 @@ class ParentCli(CliTest):
         self.assertEqual(self.fake.called("pane", "move"), [])
         self.assertEqual(self.run_main("consolidate")[0], 0)
         self.assertEqual(self.fake.agent_named("proj9")["workspace_id"], self.parent_ws)
+
+
+class StatusGroupsChildren(unittest.TestCase):
+    AGENTS = AGENTS + [
+        {"name": "a-1-x", "agent": "claude", "agent_status": "blocked", "workspace_id": "w1", "pane_id": "w1:p2",
+         "terminal_title_stripped": "Plan gate"},
+        {"name": "a-2-y", "agent": "claude", "agent_status": "working", "workspace_id": "w1", "pane_id": "w1:p3",
+         "terminal_title_stripped": "Tests"},
+        {"name": "gone-1-z", "agent": "claude", "agent_status": "idle", "workspace_id": "w1", "pane_id": "w1:p4",
+         "terminal_title_stripped": "Waiting"},
+    ]
+    RECORDS = [child_record("a-1-x", "a", 1), child_record("a-2-y", "a", 2),
+               child_record("gone-1-z", "gone", 1, state="rehomed"), child_record("a-3-old", "a", 3, state="retired")]
+
+    def test_children_follow_their_parent_and_a_child_whose_parent_is_gone_is_an_orphan(self):
+        rows = ht.status_rows(WORKSPACES, self.AGENTS, self.RECORDS)
+        self.assertEqual([(r["target"], r.get("parent"), r.get("orphan", False)) for r in rows], [
+            ("b", None, False), ("d", None, False), ("w2:p1", None, False), ("a", None, False),
+            ("a-1-x", "a", False), ("a-2-y", "a", False), ("gone-1-z", "gone", True)])
+
+    def test_the_table_indents_children_and_flags_orphans(self):
+        lines = ht.format_status(ht.status_rows(WORKSPACES, self.AGENTS, self.RECORDS)).splitlines()
+        child = next(line for line in lines if "a-1-x" in line)
+        self.assertRegex(child, r"^blocked\s+  a-1-x ")
+        orphan = next(line for line in lines if "gone-1-z" in line)
+        self.assertTrue(orphan.endswith("orphan of gone: Waiting"))
+
+    def test_a_childs_own_children_follow_it_one_level_deeper(self):
+        agents = self.AGENTS + [{"name": "a-1-x-1-q", "agent": "claude", "agent_status": "idle", "workspace_id": "w1",
+                                 "pane_id": "w1:p5", "terminal_title_stripped": "Grandchild"}]
+        rows = ht.status_rows(WORKSPACES, agents, self.RECORDS + [child_record("a-1-x-1-q", "a-1-x", 1)])
+        self.assertEqual([(r["target"], r.get("depth", 0)) for r in rows][3:7],
+                         [("a", 0), ("a-1-x", 1), ("a-1-x-1-q", 2), ("a-2-y", 1)])
+        self.assertIn("    a-1-x-1-q", ht.format_status(rows))
+
+    def test_without_records_the_output_is_unchanged(self):
+        self.assertEqual(ht.format_status(ht.status_rows(WORKSPACES, AGENTS, [])),
+                         ht.format_status(ht.status_rows(WORKSPACES, AGENTS)))
+        self.assertEqual(ht.status_rows(WORKSPACES, AGENTS, [child_record("ghost-1-x", "ghost", 1)]),
+                         ht.status_rows(WORKSPACES, AGENTS))
+
+
+class StatusReportParentLine(unittest.TestCase):
+    def test_a_report_with_a_parent_line_parses_and_one_without_still_does(self):
+        with_parent = ht.parse_status_report("---\nagent: a-1-x\nparent: a\nstate: in-progress\n---\n## Summary\nx\n")
+        without = ht.parse_status_report("---\nagent: b\nstate: in-progress\n---\n## Summary\nx\n")
+        self.assertEqual(with_parent["fields"]["parent"], "a")
+        self.assertNotIn("parent", without["fields"])
+        self.assertEqual(without["fields"]["state"], "in-progress")
+
+
+class StatusCli(CliTest):
+    def test_status_reads_the_records_and_groups_children(self):
+        self.launch_child()
+        out = self.run_main("status")[1].splitlines()
+        self.assertEqual([line.split()[1] for line in out[1:]], ["irt-102", "irt-102-1-dedupe"])
+        self.assertRegex(out[2], r"^\S+\s+  irt-102-1-dedupe ")
