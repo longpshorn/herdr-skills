@@ -3067,3 +3067,144 @@ class LayoutCli(LayoutTest):
         code, out, _ = self.run_main("open-parent", "--name", "irt-200", "--label", "IRT-200 outage", "--cwd",
                                      "/code/repo", "--shared-label", "IRT", "--prompt", "go")
         self.assertEqual((code, json.loads(out)["shared_label"]), (0, "IRT"))
+
+
+def write_report(agent, **fields):
+    header = dict({"agent": agent, "state": "in-progress", "safe_to_retire": "no"}, **fields)
+    path = ht.status_report_path(agent)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as handle:
+        handle.write("---\n%s\n---\n## Summary\nx\n" % "\n".join("%s: %s" % kv for kv in header.items()))
+    return path
+
+
+class ChildMoves(LayoutTest):
+    def test_children_lists_each_child_with_where_it_is_and_its_reports_state_and_age(self):
+        self.launch_child()
+        self.launch_child(name="irt-102-2-retry", layout="shared")
+        os.utime(write_report("irt-102-1-dedupe", state="mr-open"), (0, time_now() - 600))
+        rows = ht.children("irt-102", now=time_now())
+        self.assertEqual([(r["child"], r["where"], r["pane"], r["report"], r["report_age_minutes"]) for r in rows],
+                         [("irt-102-1-dedupe", "tab 1 PROJ-1 dedupe", "working", "mr-open", 10),
+                          ("irt-102-2-retry", "pane in the parent's tab", "working", None, None)])
+        self.assertEqual(rows[0]["worktree"], os.path.abspath("/code/repo-PROJ-1"))
+
+    def test_children_shows_a_popped_out_or_gone_child(self):
+        self.launch_child()
+        ht.write_record(child_record("irt-102-2-old", n=2))
+        ht.pop_out("irt-102-1-dedupe")
+        self.assertEqual([r["where"] for r in ht.children("irt-102")], ["own workspace", "gone"])
+
+    def test_pop_out_moves_the_child_to_its_own_workspace_and_updates_its_record(self):
+        self.launch_child()
+        ht.pop_out("irt-102-1-dedupe")
+        pane = self.fake.called("pane", "move")[0][2]
+        self.assertEqual(self.fake.called("pane", "move"), [
+            ("pane", "move", pane, "--new-workspace", "--label", "1 PROJ-1 dedupe", "--no-focus")])
+        child = self.fake.agent_named("irt-102-1-dedupe")
+        self.assertNotEqual(child["workspace_id"], self.parent_ws)
+        record = ht.read_record("irt-102-1-dedupe")
+        self.assertEqual((record["workspace_id"], record["pane_id"], record["history"][-1]["event"]),
+                         (child["workspace_id"], child["pane_id"], "pop-out"))
+
+    def test_pop_in_puts_a_workspace_layout_child_back_as_a_tab(self):
+        self.launch_child()
+        ht.pop_out("irt-102-1-dedupe")
+        popped = self.fake.agent_named("irt-102-1-dedupe")
+        ht.pop_in("irt-102-1-dedupe")
+        self.assertEqual(self.fake.called("pane", "move")[-1], (
+            "pane", "move", popped["pane_id"], "--new-tab", "--workspace", self.parent_ws, "--label",
+            "1 PROJ-1 dedupe", "--no-focus"))
+        self.assertEqual(self.fake.agent_named("irt-102-1-dedupe")["workspace_id"], self.parent_ws)
+        self.assertNotIn(popped["workspace_id"], self.fake.workspaces)
+        self.assertEqual(ht.read_record("irt-102-1-dedupe")["history"][-1]["event"], "pop-in")
+
+    def test_pop_in_puts_a_shared_layout_child_back_beside_its_parent(self):
+        self.launch_child(layout="shared")
+        ht.pop_out("irt-102-1-dedupe")
+        popped = self.fake.agent_named("irt-102-1-dedupe")
+        ht.pop_in("irt-102-1-dedupe")
+        self.assertEqual(self.fake.called("pane", "move")[-1], (
+            "pane", "move", popped["pane_id"], "--tab", self.parent_tab, "--split", "right", "--target-pane",
+            self.parent_pane, "--no-focus"))
+        self.assertEqual(self.fake.agent_named("irt-102-1-dedupe")["tab_id"], self.parent_tab)
+
+    def test_pop_out_and_pop_in_refuse_a_child_already_there_or_gone(self):
+        self.launch_child()
+        with self.assertRaisesRegex(ht.HerdrError, "already beside its parent"):
+            ht.pop_in("irt-102-1-dedupe")
+        ht.pop_out("irt-102-1-dedupe")
+        with self.assertRaisesRegex(ht.HerdrError, "already in its own workspace"):
+            ht.pop_out("irt-102-1-dedupe")
+        ht.write_record(child_record("irt-102-2-old", n=2))
+        with self.assertRaisesRegex(ht.HerdrError, "irt-102-2-old is not running"):
+            ht.pop_out("irt-102-2-old")
+        with self.assertRaisesRegex(ht.HerdrError, "No record for nobody"):
+            ht.pop_in("nobody")
+
+
+class Collapse(LayoutTest):
+    def test_refuses_a_live_child_whose_report_is_not_merged_and_safe(self):
+        self.launch_child()
+        write_report("irt-102-1-dedupe", state="merged", safe_to_retire="no")
+        with self.assertRaisesRegex(ht.HerdrError, "not finished"):
+            ht.collapse("irt-102-1-dedupe")
+        self.assertEqual(self.fake.called("tab", "close") + self.fake.called("pane", "close"), [])
+
+    def test_closes_a_merged_and_safe_childs_tab_and_keeps_its_record_as_retired(self):
+        self.launch_child()
+        tab = self.fake.agent_named("irt-102-1-dedupe")["tab_id"]
+        write_report("irt-102-1-dedupe", state="merged", safe_to_retire="yes")
+        ht.collapse("irt-102-1-dedupe")
+        self.assertEqual(self.fake.called("tab", "close"), [("tab", "close", tab)])
+        self.assertIn("irt-102", self.fake.agents)
+        record = ht.read_record("irt-102-1-dedupe")
+        self.assertEqual((record["state"], record["history"][-1]["event"]), ("retired", "collapse"))
+
+    def test_closes_only_the_pane_of_a_shared_child_never_the_parents_tab(self):
+        self.launch_child(layout="shared")
+        pane = self.fake.agent_named("irt-102-1-dedupe")["pane_id"]
+        ht.update_record("irt-102-1-dedupe", "retire", state="retired")
+        ht.collapse("irt-102-1-dedupe")
+        self.assertEqual(self.fake.called("pane", "close"), [("pane", "close", pane)])
+        self.assertEqual(self.fake.called("tab", "close"), [])
+        self.assertIn(self.parent_tab, self.fake.tabs)
+
+    def test_a_retired_child_whose_agent_exited_closes_its_recorded_pane_only_if_it_sits_in_the_worktree(self):
+        self.launch_child()
+        pane = self.fake.agent_named("irt-102-1-dedupe")["pane_id"]
+        del self.fake.agents["irt-102-1-dedupe"]
+        ht.update_record("irt-102-1-dedupe", "retire", state="retired")
+        ht.collapse("irt-102-1-dedupe")
+        self.assertEqual(self.fake.called("tab", "close"), [("tab", "close", self.fake.called("tab", "close")[0][2])])
+        self.assertNotIn(pane, self.fake.panes)
+
+    def test_a_recorded_pane_now_holding_something_else_is_left_alone(self):
+        ht.write_record(child_record(state="retired", pane_id=self.parent_pane))
+        result = ht.collapse("irt-102-1-dedupe")
+        self.assertIsNone(result["closed"])
+        self.assertEqual(self.fake.called("tab", "close") + self.fake.called("pane", "close"), [])
+        self.assertIn(self.parent_pane, self.fake.panes)
+
+
+def time_now():
+    import time
+    return time.time()
+
+
+class ChildMovesCli(LayoutCli):
+    def test_children_prints_a_table_or_json(self):
+        self.launch_child()
+        code, out, _ = self.run_main("children", "irt-102")
+        self.assertEqual(code, 0)
+        self.assertTrue(out.startswith("CHILD"))
+        self.assertIn("irt-102-1-dedupe", out)
+        self.assertEqual(json.loads(self.run_main("children", "irt-102", "--json")[1])[0]["child"], "irt-102-1-dedupe")
+
+    def test_pop_out_pop_in_and_collapse_run_by_name(self):
+        self.launch_child()
+        self.assertEqual(self.run_main("pop-out", "irt-102-1-dedupe")[0], 0)
+        self.assertEqual(self.run_main("pop-in", "irt-102-1-dedupe")[0], 0)
+        code, _, err = self.run_main("collapse", "irt-102-1-dedupe")
+        self.assertEqual(code, 1)
+        self.assertIn("not finished", err)

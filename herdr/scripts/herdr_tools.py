@@ -1706,6 +1706,174 @@ def launch_child(path, name, kind, prompt, parent, key, topic, layout="workspace
     return summary
 
 
+def need_record(child):
+    record = read_record(child)
+    if record is None:
+        raise HerdrError("No record for %s in %s; only children launched with --parent, or adopted, have one."
+                         % (child, os.path.dirname(agent_record_path(child))))
+    return record
+
+
+def child_where(record, agent, parent_agent):
+    """Where a child sits: as a tab or pane beside its parent, in its own workspace, or gone."""
+    if agent is None:
+        return "gone"
+    if parent_agent is None or agent.get("workspace_id") != parent_agent.get("workspace_id"):
+        return "own workspace"
+    if agent.get("tab_id") == parent_agent.get("tab_id"):
+        return "pane in the parent's tab"
+    return "tab " + record.get("label", "")
+
+
+def report_age_minutes(agent, now=None):
+    path = status_report_path(agent)
+    if not os.path.exists(path):
+        return None
+    return int(((now or time.time()) - os.path.getmtime(path)) // 60)
+
+
+def children(parent, now=None):
+    """Each recorded child of PARENT: where it is, its worktree, its pane state, and its status report's state and
+    age."""
+    agents = agent_list()
+    parent_agent = find_agent(parent, agents)
+    rows = []
+    for record in [r for r in list_records() if r.get("parent") == parent]:
+        agent = locate_record(record, agents)
+        report = read_report(record["child"])[1]
+        rows.append({"child": record["child"], "state": record.get("state"),
+                     "where": child_where(record, agent, parent_agent),
+                     "pane": agent.get("agent_status", "unknown") if agent else "gone",
+                     "report": report["fields"].get("state") if report else None,
+                     "report_age_minutes": report_age_minutes(record["child"], now),
+                     "worktree": record.get("worktree")})
+    return rows
+
+
+def format_children(rows):
+    if not rows:
+        return "No recorded children."
+    cols = [("CHILD", "child"), ("RECORD", "state"), ("WHERE", "where"), ("PANE", "pane"), ("REPORT", "report"),
+            ("AGE", "report_age_minutes"), ("WORKTREE", "worktree")]
+    def cell(row, key):
+        value = row[key]
+        return "-" if value is None else "%dm" % value if key == "report_age_minutes" else str(value)
+    table = [[head for head, _ in cols]] + [[cell(r, key) for _, key in cols] for r in rows]
+    widths = [max(len(line[i]) for line in table) for i in range(len(cols) - 1)]
+    return "\n".join("  ".join(v.ljust(w) for v, w in zip(line[:-1], widths)) + "  " + line[-1] for line in table)
+
+
+def located_child(child, agents=None):
+    """A child's record and its running agent; refuses one with no record or no running agent."""
+    record = need_record(child)
+    agent = locate_record(record, agents)
+    if agent is None:
+        raise HerdrError("%s is not running (no agent by that name in `herdr agent list`)." % child)
+    return record, agent
+
+
+def pop_in_command(record, agent, parent_agent):
+    """The move that puts a child back beside its parent: a new tab in the parent's workspace, or a split of the
+    parent's pane in its tab (Herdr needs both --tab and --target-pane for that)."""
+    if record.get("layout") == "shared":
+        return ("pane", "move", agent["pane_id"], "--tab", parent_agent["tab_id"], "--split", "right",
+                "--target-pane", parent_agent["pane_id"], "--no-focus")
+    return ("pane", "move", agent["pane_id"], "--new-tab", "--workspace", parent_agent["workspace_id"], "--label",
+            record.get("label", record["child"]), "--no-focus")
+
+
+def record_move(child, event, moved):
+    pane = moved["move_result"]["pane"]
+    return update_record(child, event, workspace_id=pane["workspace_id"], tab_id=pane["tab_id"],
+                         pane_id=pane["pane_id"])
+
+
+def pop_out(child):
+    """Move a child to a workspace of its own, labelled like its tab, keeping its record."""
+    agents = agent_list()
+    record, agent = located_child(child, agents)
+    parent_agent = find_agent(record.get("parent"), agents)
+    if parent_agent is None or agent["workspace_id"] != parent_agent["workspace_id"]:
+        raise HerdrError("%s is already in its own workspace; pop-in puts it back." % child)
+    moved = herdr("pane", "move", agent["pane_id"], "--new-workspace", "--label", record.get("label", child),
+                  "--no-focus")["result"]
+    return record_move(child, "pop-out", moved)
+
+
+def pop_in(child):
+    """Put a popped-out child back beside its parent, by its record's layout. Herdr removes the workspace it leaves
+    when nothing else is in it."""
+    agents = agent_list()
+    record, agent = located_child(child, agents)
+    parent_agent = find_agent(record.get("parent"), agents)
+    if parent_agent is None:
+        raise HerdrError("%s's parent %s is not running; there is nothing to pop in beside." % (child, record.get("parent")))
+    if agent["workspace_id"] == parent_agent["workspace_id"]:
+        raise HerdrError("%s is already beside its parent." % child)
+    return record_move(child, "pop-in", herdr(*pop_in_command(record, agent, parent_agent))["result"])
+
+
+def child_finished(record, report):
+    """A child may be collapsed once it is retired, or its report says merged with safe_to_retire: yes."""
+    fields = report["fields"] if report else {}
+    return record.get("state") == "retired" or (fields.get("state") == "merged" and fields.get("safe_to_retire") == "yes")
+
+
+def path_within(path, folder):
+    path, folder = os.path.normcase(os.path.normpath(path or "")), os.path.normcase(os.path.normpath(folder or ""))
+    try:
+        return bool(path) and bool(folder) and os.path.commonpath([path, folder]) == folder
+    except ValueError:  # different drives on Windows
+        return False
+
+
+def close_child_command(pane_id, panes):
+    """Close a child's tab when its pane is the only one in it, else just its pane: never anything wider."""
+    tab = next(p["tab_id"] for p in panes if p["pane_id"] == pane_id)
+    alone = [p["pane_id"] for p in panes if p["tab_id"] == tab] == [pane_id]
+    return ("tab", "close", tab) if alone else ("pane", "close", pane_id)
+
+
+def child_pane(record, agents, panes):
+    """The pane a child occupies: its agent's, found by name; else, for an agent that exited, its recorded pane only
+    while that pane still sits in the child's worktree and hosts no other agent. None when there is none."""
+    agent = locate_record(record, agents)
+    if agent is not None:
+        return agent["pane_id"]
+    pane = next((p for p in panes if p["pane_id"] == record.get("pane_id")), None)
+    hosted = {a.get("pane_id") for a in agents}
+    if pane and pane["pane_id"] not in hosted and path_within(pane.get("cwd"), record.get("worktree")):
+        return pane["pane_id"]
+    return None
+
+
+def close_child(record, event, agents=None):
+    """Close a child's tab or pane and mark its record retired. Refuses the pane this session runs in."""
+    agents = agent_list() if agents is None else agents
+    panes = herdr("pane", "list")["result"]["panes"]
+    pane = child_pane(record, agents, panes)
+    if pane is not None and pane == os.environ.get("HERDR_PANE_ID"):
+        raise HerdrError("%s runs in this pane; close it from another one." % record["child"])
+    argv = close_child_command(pane, panes) if pane is not None else None
+    if argv:
+        herdr(*argv, parse=False)
+    update_record(record["child"], event, state="retired")
+    return {"child": record["child"], "closed": " ".join(argv[:2]) + " " + argv[2] if argv else None}
+
+
+def collapse(child):
+    """Close a finished child's tab or pane, keeping its record (marked retired)."""
+    record = need_record(child)
+    report = read_report(child)[1]
+    if not child_finished(record, report):
+        fields = report["fields"] if report else {}
+        raise HerdrError("%s is not finished: its record is %s and its report says state %s, safe_to_retire %s. "
+                         "Collapse waits for a retired record, or a merged report with safe_to_retire: yes."
+                         % (child, record.get("state"), fields.get("state", "(none)"),
+                            fields.get("safe_to_retire", "(none)")))
+    return close_child(record, "collapse")
+
+
 def open_parent(name, label, cwd, shared_label, kind, prompt, sleep=time.sleep,
                 busy_timeout_seconds=PANE_BUSY_TIMEOUT):
     """Start a parent agent as a tab labelled LABEL in the shared workspace SHARED_LABEL, creating the workspace (and
@@ -2190,6 +2358,11 @@ def main(argv=None):
     nc = sub.add_parser("next-child-name")
     nc.add_argument("--parent", required=True)
     nc.add_argument("--slug", required=True)
+    ch = sub.add_parser("children")
+    ch.add_argument("parent")
+    ch.add_argument("--json", action="store_true")
+    for name in ("pop-out", "pop-in", "collapse"):
+        sub.add_parser(name).add_argument("child")
     op = sub.add_parser("open-parent")
     op.add_argument("--name", required=True)
     op.add_argument("--label", required=True)
@@ -2297,6 +2470,12 @@ def main(argv=None):
             if find_agent(args.parent, agent_list()) is None:
                 raise HerdrError("No agent named %r: --parent must be a running, named agent." % args.parent)
             print(next_child_name(args.parent, args.slug, list_records()))
+        elif args.command == "children":
+            rows = children(args.parent)
+            print(json.dumps(rows, indent=2) if args.json else format_children(rows))
+        elif args.command in ("pop-out", "pop-in", "collapse"):
+            action = {"pop-out": pop_out, "pop-in": pop_in, "collapse": collapse}[args.command]
+            print(json.dumps(action(args.child), indent=2))
         elif args.command == "open-parent":
             print(json.dumps(open_parent(args.name, args.label, args.cwd, args.shared_label, args.kind,
                                          read_prompt(args)), indent=2))
