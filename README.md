@@ -112,6 +112,9 @@ Each child has a record in `~/.cache/herdr/agents/<child>.json`: its parent, lab
 | `close-parent <parent> [--rehome]` | Close a parent. It refuses while children are live; `--rehome` moves them to an "Orphaned agents" workspace and prints a notice to pass on |
 | `adopt <agent> --parent <parent>` | Record an agent started before records existed |
 | `consolidate [--dry-run]` | Move children that sit in workspaces of their own back beside their parent |
+| `health --parent <parent> [--watch] [--forbid REGEX ...]` | Check each live child for problems: gone, blocked too long, stopped without rewriting its status report, a report state its pane contradicts, or a shell command matching a `--forbid` pattern |
+
+A parent watches its children by running `health --parent <parent> --watch` in the background. It checks every 10 minutes (`--interval-minutes`) and exits with JSON naming the child, the problem and its evidence on the first problem it finds, which wakes the parent. Herdr keeps no time for state changes, so each child's record saves when a check (or `wait`) first saw its current state; blocked time (`--blocked-minutes`, default 20) counts from then. `--forbid` reads only the part of a Claude child's transcript added since the last check. Exit codes: `health` 0 for no problems, 4 for problems; `wait` 0 on a match, 2 on timeout, 3 when the agent is gone; 1 is always a helper error.
 
 `/herdr:status` indents children under their parent and flags a child whose parent is gone. `/herdr:retire` retires a child by closing its tab or pane, never the workspace it shares. It closes any other agent's workspace only when no other agent or running process is in it, and otherwise refuses and lists them.
 

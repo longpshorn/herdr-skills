@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 import herdr_tools as ht
@@ -3592,3 +3593,398 @@ class StatusCli(CliTest):
         out = self.run_main("status")[1].splitlines()
         self.assertEqual([line.split()[1] for line in out[1:]], ["irt-102", "irt-102-1-dedupe"])
         self.assertRegex(out[2], r"^\S+\s+  irt-102-1-dedupe ")
+
+
+# ---- Health ------------------------------------------------------------------------------------------------------
+
+T0 = 1793000000.0  # any fixed instant; health stamps it in local time and reads it back
+
+
+def minutes(n):
+    return T0 + n * 60
+
+
+class ObservedState(unittest.TestCase):
+    def test_blank_missing_and_unknown_are_no_observation(self):
+        for status in ("", "  ", None, "unknown"):
+            self.assertIsNone(ht.observed_state(status))
+
+    def test_a_real_status_is_itself(self):
+        self.assertEqual(ht.observed_state(" blocked "), "blocked")
+
+
+class Observe(unittest.TestCase):
+    def agent(self, status, seq=1):
+        return {"name": "irt-102-1-dedupe", "agent_status": status, "state_change_seq": seq}
+
+    def test_the_first_observation_starts_the_state_and_its_history(self):
+        record, changed = ht.observe(child_record(), self.agent("idle", 4), T0)
+        self.assertTrue(changed)
+        self.assertEqual(record["observed"], {"state": "idle", "seq": 4, "since": ht.stamp(T0),
+                                              "checked_at": ht.stamp(T0)})
+        self.assertEqual(record["history"], [{"at": ht.stamp(T0), "event": "observed", "state": "idle", "seq": 4}])
+
+    def test_the_same_state_keeps_its_start_and_adds_no_history(self):
+        record, _ = ht.observe(child_record(), self.agent("blocked", 4), T0)
+        record, changed = ht.observe(record, self.agent("blocked", 4), minutes(10))
+        self.assertFalse(changed)
+        self.assertEqual(record["observed"]["since"], ht.stamp(T0))
+        self.assertEqual(record["observed"]["checked_at"], ht.stamp(minutes(10)))
+        self.assertEqual(len(record["history"]), 1)
+
+    def test_a_new_state_restarts_the_clock(self):
+        record, _ = ht.observe(child_record(), self.agent("working", 4), T0)
+        record, changed = ht.observe(record, self.agent("blocked", 5), minutes(10))
+        self.assertTrue(changed)
+        self.assertEqual(record["observed"]["since"], ht.stamp(minutes(10)))
+        self.assertEqual([h["state"] for h in record["history"]], ["working", "blocked"])
+
+    def test_the_same_state_with_a_new_sequence_number_was_left_and_reentered(self):
+        record, _ = ht.observe(child_record(), self.agent("idle", 4), T0)
+        record, changed = ht.observe(record, self.agent("idle", 6), minutes(10))
+        self.assertTrue(changed)
+        self.assertEqual(record["observed"]["since"], ht.stamp(minutes(10)))
+
+    def test_blank_and_unknown_change_nothing(self):
+        start, _ = ht.observe(child_record(), self.agent("blocked", 4), T0)
+        for status in ("", None, "unknown"):
+            record, changed = ht.observe(start, self.agent(status, 9), minutes(10))
+            self.assertFalse(changed)
+            self.assertEqual(record, start)
+
+    def test_working_is_remembered_as_the_last_time_it_was_seen_working(self):
+        record, _ = ht.observe(child_record(), self.agent("working", 4), T0)
+        self.assertEqual(record["observed"]["last_working_at"], ht.stamp(T0))
+        record, _ = ht.observe(record, self.agent("working", 4), minutes(10))
+        self.assertEqual(record["observed"]["last_working_at"], ht.stamp(minutes(10)))
+        record, _ = ht.observe(record, self.agent("idle", 5), minutes(20))
+        self.assertEqual(record["observed"]["last_working_at"], ht.stamp(minutes(10)))
+
+    def test_a_stop_reentered_unseen_counts_as_work_after_the_previous_check(self):
+        record, _ = ht.observe(child_record(), self.agent("idle", 4), T0)
+        record, _ = ht.observe(record, self.agent("idle", 6), minutes(10))
+        self.assertEqual(record["observed"]["last_working_at"], ht.stamp(T0))
+
+    def test_the_record_passed_in_is_not_changed(self):
+        record = child_record()
+        ht.observe(record, self.agent("idle"), T0)
+        self.assertEqual(record, child_record())
+
+
+class WaitRecordsObservations(AgentHerdrTest):
+    def wait(self, statuses, name="irt-102-1-dedupe"):
+        self.use(FakeWaitHerdr(statuses))
+        return ht.wait_for(name, ("idle",), timeout_seconds=20, poll_seconds=1, sleep=lambda s: None)
+
+    def test_a_recorded_childs_state_changes_go_to_its_history_once_each(self):
+        ht.write_record(child_record())
+        self.wait(["working", "", "working", "unknown", "idle"])
+        record = ht.read_record("irt-102-1-dedupe")
+        self.assertEqual([h["state"] for h in record["history"]], ["working", "idle"])
+        self.assertEqual(record["observed"]["state"], "idle")
+
+    def test_an_agent_without_a_record_gets_none(self):
+        self.wait(["working", "idle"], name="proj105")
+        self.assertIsNone(ht.read_record("proj105"))
+
+    def test_a_retired_record_is_left_alone(self):
+        ht.write_record(child_record(state="retired"))
+        self.wait(["idle"])
+        self.assertEqual(ht.read_record("irt-102-1-dedupe"), child_record(state="retired"))
+
+
+class ReadTranscriptFromACursor(unittest.TestCase):
+    def setUp(self):
+        folder = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, folder)
+        self.path = os.path.join(folder, "s.jsonl")
+
+    def write(self, text, mode="w"):
+        with open(self.path, mode + "b") as handle:
+            handle.write(text.encode("utf-8"))
+
+    def test_reads_only_what_follows_the_cursor_and_returns_the_new_one(self):
+        first = json.dumps(prompt_entry("a")) + "\n"
+        self.write(first + json.dumps(prompt_entry("b")) + "\n")
+        entries, end = ht.read_transcript(self.path, len(first.encode("utf-8")))
+        self.assertEqual([e["message"]["content"] for e in entries], ["b"])
+        self.assertEqual(end, os.path.getsize(self.path))
+
+    def test_a_half_written_last_line_waits_for_the_next_read(self):
+        first = json.dumps(prompt_entry("a")) + "\n"
+        self.write(first + json.dumps(prompt_entry("b"))[:10])
+        entries, end = ht.read_transcript(self.path)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(end, len(first.encode("utf-8")))
+
+    def test_a_cursor_past_the_end_reads_from_the_start(self):
+        self.write(json.dumps(prompt_entry("a")) + "\n")
+        entries, _ = ht.read_transcript(self.path, 10 ** 6)
+        self.assertEqual(len(entries), 1)
+
+    def test_offsets_count_bytes_not_characters(self):
+        first = json.dumps(prompt_entry("caf\u00e9 \u2014 ok"), ensure_ascii=False) + "\n"
+        self.write(first + json.dumps(prompt_entry("b")) + "\n")
+        _, end = ht.read_transcript(self.path)
+        self.assertEqual(end, os.path.getsize(self.path))
+        entries, _ = ht.read_transcript(self.path, len(first.encode("utf-8")))
+        self.assertEqual([e["message"]["content"] for e in entries], ["b"])
+
+    def test_transcript_entries_still_reads_everything(self):
+        self.write(json.dumps(prompt_entry("a")) + "\n" + json.dumps(prompt_entry("b")) + "\n")
+        self.assertEqual(len(ht.transcript_entries(self.path)), 2)
+
+
+class ForbiddenCommands(unittest.TestCase):
+    ENTRIES = [prompt_entry("go"), tool_entry("Bash", command="git push --force origin x", description="push"),
+               tool_entry("Read", file_path="/x/git push --force"), result_entry(),
+               tool_entry("PowerShell", command="Remove-Item -Recurse C:\\x"), tool_entry("Bash", command="ls")]
+
+    def test_shell_commands_are_tool_calls_with_a_command(self):
+        self.assertEqual(ht.shell_commands(self.ENTRIES),
+                         ["git push --force origin x", "Remove-Item -Recurse C:\\x", "ls"])
+
+    def test_commands_matching_any_pattern(self):
+        patterns = [re.compile(r"push\s+--force"), re.compile(r"(?i)remove-item")]
+        self.assertEqual(ht.forbidden_commands(self.ENTRIES, patterns),
+                         ["git push --force origin x", "Remove-Item -Recurse C:\\x"])
+
+    def test_no_patterns_match_nothing(self):
+        self.assertEqual(ht.forbidden_commands(self.ENTRIES, []), [])
+
+
+def health_report(state):
+    return ht.parse_status_report("---\nagent: x\nstate: %s\n---\n## Summary\nx\n" % state)
+
+
+class ChildProblems(unittest.TestCase):
+    def problems(self, pane="idle", since=0, last_working=None, report="in-progress", report_age=60, now=11,
+                 forbidden=(), agent=True):
+        observed = {"state": pane, "seq": 1, "since": ht.stamp(minutes(since)), "checked_at": ht.stamp(minutes(now))}
+        if last_working is not None:
+            observed["last_working_at"] = ht.stamp(minutes(last_working))
+        record = child_record(observed=observed)
+        found = ht.child_problems(record, {"agent_status": pane} if agent else None,
+                                  health_report(report) if report else None, report_age, list(forbidden),
+                                  minutes(now), interval_minutes=10, blocked_minutes=20)
+        for problem in found:
+            self.assertEqual(problem["child"], "irt-102-1-dedupe")
+            self.assertTrue(problem["evidence"])
+        return [p["kind"] for p in found]
+
+    def test_a_healthy_working_child_has_none(self):
+        self.assertEqual(self.problems(pane="working", last_working=11, report_age=1), [])
+
+    def test_a_child_no_agent_answers_to_is_gone(self):
+        self.assertEqual(self.problems(agent=False), ["gone"])
+
+    def test_blocked_past_the_limit(self):
+        self.assertEqual(self.problems(pane="blocked", now=21, report="waiting-on-owner", report_age=1), ["blocked"])
+        self.assertEqual(self.problems(pane="blocked", now=19, report="waiting-on-owner", report_age=1), [])
+
+    def test_stopped_without_rewriting_its_report_since_it_was_last_seen_working(self):
+        # last seen working at -5, so its report (written at -15) predates that work
+        self.assertIn("stale", self.problems(last_working=-5, report="waiting-on-owner", report_age=26))
+
+    def test_a_report_rewritten_after_the_work_is_not_stale(self):
+        self.assertEqual(self.problems(last_working=-5, report="waiting-on-owner", report_age=12), [])
+
+    def test_a_stop_younger_than_one_interval_is_not_judged_yet(self):
+        self.assertEqual(self.problems(last_working=-5, report="waiting-on-owner", report_age=26, now=9), [])
+
+    def test_a_stopped_child_with_no_report_is_stale(self):
+        self.assertEqual(self.problems(report=None, report_age=None), ["stale"])
+
+    def test_never_seen_working_is_not_stale_with_a_report(self):
+        self.assertEqual(self.problems(report="waiting-on-owner", report_age=500), [])
+
+    def test_done_counts_as_stopped(self):
+        self.assertEqual(self.problems(pane="done", report=None, report_age=None), ["stale"])
+
+    def test_in_progress_while_stopped_for_more_than_an_interval(self):
+        self.assertEqual(self.problems(report="in-progress", report_age=1), ["mismatch"])
+        self.assertEqual(self.problems(report="in-progress", report_age=1, now=9), [])
+
+    def test_waiting_on_owner_while_working_for_more_than_an_interval(self):
+        self.assertEqual(self.problems(pane="working", last_working=11, report="waiting-on-owner"), ["mismatch"])
+        self.assertEqual(self.problems(pane="working", last_working=9, now=9, report="waiting-on-owner"), [])
+
+    def test_each_forbidden_command_is_a_problem(self):
+        kinds = self.problems(pane="working", last_working=11, report_age=1, forbidden=["rm -rf /", "git push -f"])
+        self.assertEqual(kinds, ["forbidden", "forbidden"])
+
+    def test_a_child_never_observed_is_checked_for_gone_and_forbidden_only(self):
+        record = child_record()
+        found = ht.child_problems(record, {"agent_status": "unknown"}, None, None, ["rm -rf /"], minutes(60),
+                                  interval_minutes=10, blocked_minutes=20)
+        self.assertEqual([p["kind"] for p in found], ["forbidden"])
+
+
+class HealthTest(LayoutTest):
+    """A parent irt-102 with one recorded Claude child, its status report and its transcript in the test home."""
+
+    CHILD = "irt-102-1-dedupe"
+
+    def setUp(self):
+        super().setUp()
+        _, tab, pane = self.fake.add_workspace("child")
+        self.fake.add_agent(self.CHILD, pane, "working")
+        self.fake.agents[self.CHILD].update(state_change_seq=1, agent_session={"value": "sess-9"})
+        ht.write_record(child_record())
+        folder = os.path.join(self.home, ".claude", "projects", "-code-repo")
+        os.makedirs(folder)
+        self.transcript = os.path.join(folder, "sess-9.jsonl")
+        self.add_entries(prompt_entry("Read the brief"))
+
+    def add_entries(self, *entries):
+        with open(self.transcript, "a", encoding="utf-8") as handle:
+            for entry in entries:
+                handle.write(json.dumps(entry) + "\n")
+
+    def set_pane(self, status, seq):
+        self.fake.agents[self.CHILD].update(agent_status=status, state_change_seq=seq)
+
+    def write_report(self, state, at):
+        path = ht.status_report_path(self.CHILD)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as handle:
+            handle.write("---\nagent: %s\nstate: %s\n---\n## Summary\nx\n" % (self.CHILD, state))
+        os.utime(path, (at, at))
+
+    def check(self, at, forbid=(r"push\s+--force",)):
+        return ht.health_check("irt-102", [re.compile(p) for p in forbid], interval_minutes=10, blocked_minutes=20,
+                               now=minutes(at))
+
+
+class HealthCheck(HealthTest):
+    def test_a_healthy_child_has_no_problems_and_its_observation_is_recorded(self):
+        self.write_report("in-progress", minutes(0))
+        result = self.check(0)
+        self.assertEqual(result["problems"], [])
+        self.assertEqual(result["parent"], "irt-102")
+        row = result["children"][0]
+        self.assertEqual((row["child"], row["pane"], row["report"], row["forbid"]),
+                         (self.CHILD, "working", "in-progress", "checked"))
+        record = ht.read_record(self.CHILD)
+        self.assertEqual(record["observed"]["state"], "working")
+        self.assertEqual(record["transcript_cursor"],
+                         {"session": "sess-9", "offset": os.path.getsize(self.transcript)})
+
+    def test_a_forbidden_command_is_reported_once(self):
+        self.write_report("in-progress", minutes(0))
+        self.add_entries(tool_entry("Bash", command="git push --force origin main"))
+        first = self.check(0)
+        self.assertEqual([(p["kind"], p["child"]) for p in first["problems"]], [("forbidden", self.CHILD)])
+        self.assertIn("git push --force origin main", first["problems"][0]["evidence"])
+        self.assertEqual(self.check(5)["problems"], [])
+        self.add_entries(tool_entry("Bash", command="ls"), tool_entry("Bash", command="git push  --force"))
+        self.assertEqual(len(self.check(10)["problems"]), 1)
+
+    def test_a_child_that_stops_without_rewriting_its_report_is_stale_and_mismatched(self):
+        self.write_report("in-progress", minutes(-30))
+        self.check(0)
+        self.set_pane("idle", 2)
+        self.check(10)
+        kinds = sorted(p["kind"] for p in self.check(21)["problems"])
+        self.assertEqual(kinds, ["mismatch", "stale"])
+
+    def test_one_history_entry_per_state_change(self):
+        self.write_report("in-progress", minutes(0))
+        for at, status, seq in ((0, "working", 1), (10, "working", 1), (20, "", 1), (30, "blocked", 2)):
+            self.set_pane(status, seq)
+            self.check(at)
+        history = [h for h in ht.read_record(self.CHILD)["history"] if h["event"] == "observed"]
+        self.assertEqual([h["state"] for h in history], ["working", "blocked"])
+
+    def test_a_child_that_is_gone_is_a_problem_not_a_crash(self):
+        del self.fake.agents[self.CHILD]
+        result = self.check(0)
+        self.assertEqual([p["kind"] for p in result["problems"]], ["gone"])
+        self.assertEqual(result["children"][0]["pane"], "gone")
+
+    def test_only_this_parents_live_children_are_checked(self):
+        ht.write_record(child_record("irt-102-2-old", n=2, state="retired"))
+        ht.write_record(child_record("irt-9-1-other", parent="irt-9"))
+        self.write_report("in-progress", minutes(0))
+        self.assertEqual([r["child"] for r in self.check(0)["children"]], [self.CHILD])
+
+    def test_without_patterns_the_transcript_is_not_read(self):
+        self.write_report("in-progress", minutes(0))
+        result = self.check(0, forbid=())
+        self.assertEqual(result["children"][0]["forbid"], "off")
+        self.assertNotIn("transcript_cursor", ht.read_record(self.CHILD))
+
+    def test_a_child_with_no_transcript_is_unchecked_not_a_problem(self):
+        self.fake.agents[self.CHILD].update(agent="codex", agent_session=None)
+        self.write_report("in-progress", minutes(0))
+        result = self.check(0)
+        self.assertEqual((result["children"][0]["forbid"], result["problems"]), ("unchecked", []))
+
+    def test_a_new_session_starts_its_cursor_again(self):
+        self.write_report("in-progress", minutes(0))
+        self.check(0)
+        self.fake.agents[self.CHILD]["agent_session"] = {"value": "sess-10"}
+        with open(os.path.join(os.path.dirname(self.transcript), "sess-10.jsonl"), "w") as handle:
+            handle.write(json.dumps(tool_entry("Bash", command="git push --force")) + "\n")
+        self.assertEqual([p["kind"] for p in self.check(5)["problems"]], ["forbidden"])
+
+
+class HealthWatch(HealthTest):
+    def watch(self, on_sleep=lambda: None):
+        clock, sleeps = [minutes(0)], []
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            clock[0] += seconds
+            on_sleep()
+
+        result = ht.health_watch("irt-102", [], interval_minutes=10, blocked_minutes=20, sleep=sleep,
+                                 now=lambda: clock[0])
+        return result, sleeps
+
+    def test_checks_every_interval_and_returns_the_first_problem(self):
+        self.write_report("waiting-on-owner", minutes(0))
+        self.set_pane("blocked", 2)
+        result, sleeps = self.watch()
+        self.assertEqual([p["kind"] for p in result["problems"]], ["blocked"])
+        self.assertEqual(sleeps, [600, 600, 600])
+        self.assertEqual(result["checked_at"], ht.stamp(minutes(30)))
+
+    def test_returns_with_no_problems_once_no_live_child_is_left(self):
+        self.write_report("in-progress", minutes(0))
+
+        def retire():
+            ht.update_record(self.CHILD, "retired", state="retired")
+
+        result, sleeps = self.watch(retire)
+        self.assertEqual((result["children"], result["problems"], sleeps), ([], [], [600]))
+
+
+class HealthCli(HealthTest, CliTest):
+    def test_no_problems_exits_0_with_json(self):
+        self.write_report("in-progress", time.time())
+        code, out, _ = self.run_main("health", "--parent", "irt-102")
+        self.assertEqual((code, json.loads(out)["problems"]), (0, []))
+
+    def test_problems_exit_4_with_json(self):
+        self.write_report("in-progress", time.time())
+        self.add_entries(tool_entry("Bash", command="git push --force"))
+        code, out, _ = self.run_main("health", "--parent", "irt-102", "--forbid", r"push\s+--force",
+                                     "--forbid", "rm -rf")
+        self.assertEqual((code, [p["kind"] for p in json.loads(out)["problems"]]), (4, ["forbidden"]))
+
+    def test_a_bad_pattern_is_a_helper_error(self):
+        code, out, err = self.run_main("health", "--parent", "irt-102", "--forbid", "(")
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn("--forbid", err)
+
+    def test_watch_passes_its_limits_through(self):
+        calls, saved = [], ht.health_watch
+        ht.health_watch = lambda *args, **kwargs: calls.append((args, kwargs)) or {"problems": [], "children": []}
+        try:
+            code = self.run_main("health", "--parent", "irt-102", "--watch", "--interval-minutes", "5",
+                                 "--blocked-minutes", "15")[0]
+        finally:
+            ht.health_watch = saved
+        self.assertEqual(code, 0)
+        self.assertEqual(calls, [(("irt-102", []), {"interval_minutes": 5.0, "blocked_minutes": 15.0})])
