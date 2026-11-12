@@ -53,7 +53,16 @@
       agent. Prints JSON; "verified" is yes, no or unverified (other agent kinds). Exits 1 when it is no.
   herdr_tools.py wait --name AGENT --until STATES [--timeout-seconds 600]
       Wait until the agent reaches one of the comma-separated STATES. A blank, missing or unknown status means keep
-      waiting. Exits 0 on a match, 2 on timeout, 3 when the agent is gone.
+      waiting. Exits 0 on a match, 2 on timeout, 3 when the agent is gone. A recorded child's state changes go to its
+      record's history.
+  herdr_tools.py health --parent PARENT [--watch] [--interval-minutes 10] [--blocked-minutes 20] [--forbid REGEX ...]
+      Check PARENT's live recorded children and print JSON with each problem, its child and evidence: gone; blocked
+      longer than --blocked-minutes; stale (idle or done for over an interval, and its status report not rewritten
+      since it was last seen working, or no report); mismatch (report in-progress while stopped, or waiting-on-owner
+      while working, for over an interval); forbidden (a shell command in its Claude transcript since the last check
+      matches a --forbid pattern). Times are counted from the first observation, saved in the child's record. Exits 0
+      with no problems, 4 with problems. --watch checks every interval and exits 4 on the first problem, 0 once
+      PARENT has no live child left.
   herdr_tools.py report-path --name AGENT
       Create the status-report directory and print the file AGENT keeps its status report in.
   herdr_tools.py brief-path --name AGENT
@@ -2288,16 +2297,28 @@ def find_transcript(session_id, home=None):
 
 
 def transcript_entries(path):
+    return read_transcript(path)[0]
+
+
+def read_transcript(path, offset=0):
+    """The entries on the complete lines after byte OFFSET, and the offset after the last of them. A half-written last
+    line is left for the next read; an offset past the end (a rewritten file) reads from the start."""
+    with open(path, "rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        if offset > handle.tell():
+            offset = 0
+        handle.seek(offset)
+        data = handle.read()
+    complete = data[:data.rfind(b"\n") + 1]
     entries = []
-    with open(path, encoding="utf-8", errors="replace") as handle:
-        for line in handle:
-            try:
-                entry = json.loads(line)
-            except ValueError:
-                continue
-            if isinstance(entry, dict):
-                entries.append(entry)
-    return entries
+    for line in complete.splitlines():
+        try:
+            entry = json.loads(line.decode("utf-8", errors="replace"))
+        except ValueError:
+            continue
+        if isinstance(entry, dict):
+            entries.append(entry)
+    return entries, offset + len(complete)
 
 
 def prompt_text(entry):
@@ -2412,15 +2433,17 @@ def wait_for(name, until, timeout_seconds=600, poll_seconds=3, gone_seconds=30, 
     waited, missing, last = 0, 0, None
     while True:
         try:
-            status = (agent_info(name).get("agent_status") or "").strip()
+            info = agent_info(name)
+            status = observed_state(info.get("agent_status"))
             missing = 0
+            note_observation(name, info)
         except HerdrError as error:
             if "agent_not_found" not in str(error):
                 raise
-            status, missing = "", missing + poll_seconds
+            status, missing = None, missing + poll_seconds
             if missing > gone_seconds:
                 return {"agent": name, "state": "gone", "last": last, "waited": waited}
-        if status and status != "unknown":
+        if status:
             last = status
             if status in until:
                 return {"agent": name, "state": status, "waited": waited}
@@ -2428,6 +2451,173 @@ def wait_for(name, until, timeout_seconds=600, poll_seconds=3, gone_seconds=30, 
             return {"agent": name, "state": "timeout", "last": last, "waited": waited}
         sleep(poll_seconds)
         waited += poll_seconds
+
+
+# ---- Health: a parent's check on its children ---------------------------------------------------------------------
+# Herdr keeps a state_change_seq per agent but no timestamp, so each child's record carries what health (and wait) last
+# observed: the state, since when (its first observation), and the last time it was seen working. A history entry is
+# added only when the state changes. A per-child cursor into the Claude transcript lets --forbid read only new lines.
+
+STAMP_FORMAT = "%Y-%m-%dT%H:%M:%S"
+HEALTH_INTERVAL_MINUTES = 10
+HEALTH_BLOCKED_MINUTES = 20
+
+
+def stamp(t):
+    return time.strftime(STAMP_FORMAT, time.localtime(t))
+
+
+def stamp_time(text):
+    return time.mktime(time.strptime(text, STAMP_FORMAT))
+
+
+def observed_state(status):
+    """A pane status, or None for a blank, missing or unknown one: no observation, never a change."""
+    status = (status or "").strip()
+    return status if status and status != "unknown" else None
+
+
+def observe(record, agent, now):
+    """RECORD with AGENT's pane state observed at NOW, and whether the state changed. A new state, or the same state
+    under a new state_change_seq (left and re-entered between checks), restarts `since`. A change into any state but
+    working means the child may have worked since the previous check, so `last_working_at` becomes that check."""
+    state = observed_state(agent.get("agent_status"))
+    if state is None:
+        return record, False
+    seq = agent.get("state_change_seq")
+    old = record.get("observed") or {}
+    at = stamp(now)
+    changed = state != old.get("state") or (seq is not None and old.get("seq") is not None and seq != old.get("seq"))
+    observed = dict(old, state=state, seq=seq, checked_at=at)
+    if changed:
+        observed["since"] = at
+        if old.get("checked_at") and state != "working":
+            observed["last_working_at"] = old["checked_at"]
+    if state == "working":
+        observed["last_working_at"] = at
+    record = dict(record, observed=observed)
+    if changed:
+        record["history"] = list(record.get("history") or []) + [
+            {"at": at, "event": "observed", "state": state, "seq": seq}]
+    return record, changed
+
+
+def shell_commands(entries):
+    """Every command the agent ran through a shell tool (any tool call whose input has a `command`), in order."""
+    commands = []
+    for entry in entries:
+        if entry.get("type") != "assistant":
+            continue
+        for block in (entry.get("message") or {}).get("content") or []:
+            if isinstance(block, dict) and block.get("type") == "tool_use":
+                command = (block.get("input") or {}).get("command")
+                if isinstance(command, str):
+                    commands.append(command)
+    return commands
+
+
+def forbidden_commands(entries, patterns):
+    return [c for c in shell_commands(entries) if any(p.search(c) for p in patterns)]
+
+
+STOPPED = ("idle", "done")
+
+
+def child_problems(record, agent, report, report_age, forbidden, now, interval_minutes, blocked_minutes):
+    """What is wrong with one child: gone, blocked too long, stopped without rewriting its report (stale), a report
+    state its pane contradicts for more than one interval (mismatch), and each forbidden command it ran."""
+    child = record["child"]
+
+    def problem(kind, evidence):
+        return {"child": child, "kind": kind, "evidence": evidence}
+
+    if agent is None:
+        return [problem("gone", "No running agent is named %s, but its record is live." % child)]
+    problems = []
+    observed = record.get("observed") or {}
+    if observed.get("since") and observed.get("state") == observed_state(agent.get("agent_status")):
+        state = observed["state"]
+        held = (now - stamp_time(observed["since"])) / 60
+        report_state = report["fields"].get("state") if report else None
+        if state == "blocked" and held > blocked_minutes:
+            problems.append(problem("blocked", "Blocked since %s (%d min, first observed then; limit %g)."
+                                    % (observed["since"], held, blocked_minutes)))
+        if state in STOPPED and held > interval_minutes:
+            last_working = observed.get("last_working_at")
+            if report_age is None:
+                problems.append(problem("stale", "%s since %s with no status report." % (state, observed["since"])))
+            elif last_working and now - report_age * 60 < stamp_time(last_working):
+                problems.append(problem("stale", "%s since %s; its report (%d min old) was not rewritten after it "
+                                        "was last seen working at %s." % (state, observed["since"], report_age,
+                                                                          last_working)))
+            if report_state == "in-progress":
+                problems.append(problem("mismatch", "Report says in-progress, pane %s since %s."
+                                        % (state, observed["since"])))
+        if state == "working" and held > interval_minutes and report_state == "waiting-on-owner":
+            problems.append(problem("mismatch", "Report says waiting-on-owner, pane working since %s."
+                                    % observed["since"]))
+    problems += [problem("forbidden", "Ran: %s" % command[:300]) for command in forbidden]
+    return problems
+
+
+def scan_transcript(record, agent, patterns):
+    """RECORD with its transcript cursor moved past what was read, the commands that matched PATTERNS since the last
+    check, and whether the check ran: "checked", "unchecked" (no Claude transcript) or "off" (no patterns)."""
+    if not patterns:
+        return record, [], "off"
+    session = (agent.get("agent_session") or {}).get("value") if agent.get("agent") == "claude" else None
+    path = find_transcript(session) if session else None
+    if not path:
+        return record, [], "unchecked"
+    cursor = record.get("transcript_cursor") or {}
+    entries, end = read_transcript(path, cursor.get("offset", 0) if cursor.get("session") == session else 0)
+    record = dict(record, transcript_cursor={"session": session, "offset": end})
+    return record, forbidden_commands(entries, patterns), "checked"
+
+
+def health_check(parent, patterns, interval_minutes=HEALTH_INTERVAL_MINUTES, blocked_minutes=HEALTH_BLOCKED_MINUTES,
+                 now=None):
+    """One check of PARENT's live children: each one's state, and every problem found, with its evidence. Each
+    child's observation and transcript cursor are saved to its record."""
+    now = now or time.time()
+    agents = agent_list()
+    rows, problems = [], []
+    for record in [r for r in list_records() if r.get("parent") == parent and r.get("state") == "live"]:
+        child = record["child"]
+        agent = locate_record(record, agents)
+        forbidden, forbid = [], "unchecked"
+        if agent is not None:
+            record, _ = observe(record, agent, now)
+            record, forbidden, forbid = scan_transcript(record, agent, patterns)
+            write_record(record)
+        report = read_report(child)[1]
+        age = report_age_minutes(child, now)
+        problems += child_problems(record, agent, report, age, forbidden, now, interval_minutes, blocked_minutes)
+        observed = record.get("observed") or {}
+        rows.append({"child": child, "pane": agent.get("agent_status", "unknown") if agent else "gone",
+                     "since": observed.get("since"), "report": report["fields"].get("state") if report else None,
+                     "report_age_minutes": age, "forbid": forbid})
+    return {"parent": parent, "checked_at": stamp(now), "children": rows, "problems": problems}
+
+
+def health_watch(parent, patterns, interval_minutes=HEALTH_INTERVAL_MINUTES, blocked_minutes=HEALTH_BLOCKED_MINUTES,
+                 sleep=time.sleep, now=time.time):
+    """Check every interval until a check finds a problem, or PARENT has no live child left; return that check."""
+    while True:
+        result = health_check(parent, patterns, interval_minutes, blocked_minutes, now())
+        if result["problems"] or not result["children"]:
+            return result
+        sleep(interval_minutes * 60)
+
+
+def note_observation(name, agent, now=None):
+    """Record a live child's pane state when it changed; anything else is left alone."""
+    record = read_record(name)
+    if not record or record.get("state") != "live":
+        return
+    record, changed = observe(record, agent, now or time.time())
+    if changed:
+        write_record(record)
 
 
 # ---- Skills for other coding agents ---------------------------------------------------------------------------------
@@ -2718,6 +2908,12 @@ def main(argv=None):
     dv.add_argument("--topic", required=True)
     dv.add_argument("--from", dest="sender")
     dv.add_argument("--timeout-seconds", type=float, default=300)
+    he = sub.add_parser("health")
+    he.add_argument("--parent", required=True)
+    he.add_argument("--watch", action="store_true")
+    he.add_argument("--interval-minutes", type=float, default=HEALTH_INTERVAL_MINUTES)
+    he.add_argument("--blocked-minutes", type=float, default=HEALTH_BLOCKED_MINUTES)
+    he.add_argument("--forbid", action="append", default=[], metavar="REGEX")
     wt = sub.add_parser("wait")
     wt.add_argument("--name", required=True)
     wt.add_argument("--until", required=True, help="comma-separated states: idle, working, blocked, done")
@@ -2829,6 +3025,17 @@ def main(argv=None):
             result = wait_for(args.name, until, timeout_seconds=args.timeout_seconds)
             print(json.dumps(result, indent=2))
             return {"timeout": 2, "gone": 3}.get(result["state"], 0)
+        elif args.command == "health":
+            patterns = []
+            for pattern in args.forbid:
+                try:
+                    patterns.append(re.compile(pattern))
+                except re.error as error:
+                    raise HerdrError("--forbid %r is not a regular expression: %s." % (pattern, error))
+            limits = {"interval_minutes": args.interval_minutes, "blocked_minutes": args.blocked_minutes}
+            result = (health_watch if args.watch else health_check)(args.parent, patterns, **limits)
+            print(json.dumps(result, indent=2))
+            return 4 if result["problems"] else 0
         elif args.command == "report-path":
             path = status_report_path(args.name)
             os.makedirs(os.path.dirname(path), exist_ok=True)
