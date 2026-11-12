@@ -55,7 +55,7 @@ Before you define any rule, threshold, mapping or list of values, search for an 
 
 ## Status report
 
-Keep a status report at `<status report path>` (outside the worktree, so it never shows in `git status`). Overwrite the whole file every time you stop and hand back to the owner: at the plan gate, when you ask them something, after opening the MR, after the pipeline result, and when you finish. Then print the same text as your last message. `/herdr:retire` reads this file to decide whether the session can close and to log its outcome, so keep it true and exact. When the owner gives a gate verdict, restate each item of it in the Summary.
+Keep a status report at `<status report path>` (outside the worktree, so it never shows in `git status`). Overwrite the whole file every time you stop and hand back to the owner: at the plan gate, when you ask them something, after opening the MR, after the pipeline result, and when you finish. Then print the same text as your last message. `/herdr:retire` reads this file to decide whether the session can close and to log its outcome, so keep it true and exact. When the owner gives a gate verdict, restate each item of it in the Summary. When you resume work after a gate verdict, first rewrite the report's header with `state: in-progress`.
 
 Use this format. The header lines must stay `key: value`; write "None" in an empty section.
 
