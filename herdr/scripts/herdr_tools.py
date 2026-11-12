@@ -2556,7 +2556,8 @@ def child_problems(record, agent, report, report_age, forbidden, now, interval_m
         if state == "working" and held > interval_minutes and report_state == "waiting-on-owner":
             problems.append(problem("mismatch", "Report says waiting-on-owner, pane working since %s."
                                     % observed["since"]))
-    problems += [problem("forbidden", "Ran: %s" % command[:300]) for command in forbidden]
+    problems += [problem("forbidden", "Shell command since the last check: %s" % command[:300])
+                 for command in forbidden]
     return problems
 
 
