@@ -73,12 +73,12 @@ Codex and omp can also add this repository as a Claude Code-style marketplace (`
 6. **Validate and approve.** Review the MR and try the change. If the project requires an approval, it must come from someone other than the MR's author: ask a teammate.
 7. **Retire.** `/herdr:retire <agent>` checks the report and the MR. After one confirmation it does the following:
    - squash-merges the MR pinned to its tested commit, rebasing and waiting for the pipeline first if the MR is behind;
-   - closes the agent's workspace and removes its worktree and branch;
+   - closes the agent's workspace (a child's tab or pane), refusing if anything else alive is in it, and removes its worktree and branch;
    - moves the ticket to done and fast-forwards your main checkout;
    - restarts the main dev server if dependencies or config changed;
    - turns each valid follow-up into a ticket.
 
-   It stops and says why on anything unsafe: a failed or missing pipeline, conflicts, unresolved threads, a missing approval, uncommitted work, or open questions.
+   It stops and says why on anything unsafe: a failed or missing pipeline, conflicts, unresolved threads, a missing approval, uncommitted work, open questions, or another agent or process in the workspace it would close.
 
 An agent's MR doesn't have to be in the repo it works in. When its worktree branch has no MR, retire uses the one its status report names, and `herdr_tools.py land --mr <url or group/project!iid>` lands any MR directly, with the same checks.
 
@@ -97,6 +97,23 @@ Retire checks that the worktree's HEAD landed. When `land` rebased the MR first,
 | `/herdr:ask <agent> <message>` | Answer a plan gate or question, or send an instruction, as a file plus a one-line pointer so long messages arrive whole (checked in the agent's transcript for Claude agents); optionally wait for the reply |
 | `/herdr:run <command>` | Run a dev server, test run or watcher in a sibling pane and read its output |
 | `/herdr:retire <agent>` | Land a validated MR, clean up, close the ticket, update main, capture follow-ups |
+
+## Parents and children
+
+An agent can spawn its own children, for example an incident agent that starts one fix agent per ticket and answers their plan gates. A child is launched with `--parent`. Its name is `<parent>-<n>-<slug>` (`herdr_tools.py next-child-name`), and it opens beside the parent instead of in a workspace of its own. In the `workspace` layout (the default) it is a tab in the parent's workspace, labelled `<n> <KEY> <topic>`. In the `shared` layout it is a split pane in the parent's tab, and parents themselves are tabs in one shared workspace (`open-parent`). The layout is an argument the caller passes, not a profile field.
+
+Each child has a record in `~/.cache/herdr/agents/<child>.json`: its parent, label, layout, worktree, branch and state. Herdr reports worktrees only per workspace, so the record is what lets the commands below find a child's worktree. They find the child itself by name, since pane ids change when a pane moves.
+
+| Command | What it does |
+| - | - |
+| `children <parent>` | Each child, where it is, its worktree, pane state, and status report state and age |
+| `pop-out <child>` / `pop-in <child>` | Move a child to a workspace of its own, full size, and back |
+| `collapse <child>` | Close a finished child's tab or pane, keeping its record |
+| `close-parent <parent> [--rehome]` | Close a parent. It refuses while children are live; `--rehome` moves them to an "Orphaned agents" workspace and prints a notice to pass on |
+| `adopt <agent> --parent <parent>` | Record an agent started before records existed |
+| `consolidate [--dry-run]` | Move children that sit in workspaces of their own back beside their parent |
+
+`/herdr:status` indents children under their parent and flags a child whose parent is gone. `/herdr:retire` retires a child by closing its tab or pane, never the workspace it shares. It closes any other agent's workspace only when no other agent or running process is in it, and otherwise refuses and lists them.
 
 ## What the agent needs from you
 

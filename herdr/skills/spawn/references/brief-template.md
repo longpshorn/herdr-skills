@@ -5,7 +5,7 @@ Fill every section from the ticket, the repo's `AGENTS.md` (or `CLAUDE.md`), the
 ```markdown
 # Brief: <KEY>, <one-line goal>
 
-You are implementing **<KEY>** "<ticket title>" (<tracker>) in the <repo> repo, for <owner's name>, the owner: the person who approves your plan and lands your MR. Read this brief completely before starting.
+You are implementing **<KEY>** "<ticket title>" (<tracker>) in the <repo> repo, for <owner's name>, the owner: the person who approves your plan and lands your MR. <With a parent agent: "Your parent agent `<parent>` acts for the owner: it answers your gates and lands your MR.">. Read this brief completely before starting.
 
 ## Where you are
 
@@ -38,7 +38,7 @@ Before you define any rule, threshold, mapping or list of values, search for an 
 
 ## Process
 
-1. <The profile's `brief.implement`, with `{key}` filled in. Whatever it says, planning is a hard stop: present the plan and wait for the owner's approval in this pane.>
+1. <The profile's `brief.implement`, with `{key}` filled in. Whatever it says, planning is a hard stop: present the plan as plain text and end your turn to wait for the owner's approval in this pane. Never present it as a multiple-choice dialog: an answer to a dialog can be lost.>
 2. Commits are `<type>: <KEY> <desc>`, small and logical, ending with the attribution lines your tool's instructions give, if any (Claude Code: the Co-Authored-By line).
 3. Done means: <the repo's full check and test commands> are clean; docs are updated (<the ones in scope>); the branch is rebased on `origin/<default branch>`.
 4. Push and open the MR/PR with <the profile's `brief.mr_create`> targeting `<default branch>`, titled `<type>: <KEY> <summary>`, describing what was built and its verification (each item Verified or Unverified), ending with the attribution line your tool's instructions give, if any (Claude Code: `🤖 Generated with [Claude Code](https://claude.com/claude-code)`). If that command announces the MR in chat, that announcement is expected; post nothing else to chat. Never merge it: the owner lands it with `/herdr:retire` after validating.
@@ -55,12 +55,13 @@ Before you define any rule, threshold, mapping or list of values, search for an 
 
 ## Status report
 
-Keep a status report at `<status report path>` (outside the worktree, so it never shows in `git status`). Overwrite the whole file every time you stop and hand back to the owner: at the plan gate, when you ask them something, after opening the MR, after the pipeline result, and when you finish. Then print the same text as your last message. `/herdr:retire` reads this file to decide whether the session can close and to log its outcome, so keep it true and exact.
+Keep a status report at `<status report path>` (outside the worktree, so it never shows in `git status`). Overwrite the whole file every time you stop and hand back to the owner: at the plan gate, when you ask them something, after opening the MR, after the pipeline result, and when you finish. Then print the same text as your last message. `/herdr:retire` reads this file to decide whether the session can close and to log its outcome, so keep it true and exact. When the owner gives a gate verdict, restate each item of it in the Summary.
 
 Use this format. The header lines must stay `key: value`; write "None" in an empty section.
 
     ---
     agent: <agent name>
+    parent: <the parent agent that spawned you, or none>
     ticket: <KEY>
     branch: <branch>
     state: in-progress | waiting-on-owner | mr-open | merged | abandoned

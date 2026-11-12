@@ -10,6 +10,35 @@
       Open WORKTREE as a background workspace, start a named agent in it, stop if a folder-trust prompt shows,
       otherwise send the prompt and confirm the agent started working. Prints a JSON summary. Herdr finds or creates
       the repo's parent workspace. At a trust prompt the prompt is saved for send-prompt.
+  herdr_tools.py launch --path WORKTREE --name CHILD --parent PARENT --key KEY --topic TOPIC [--layout workspace|shared]
+                        [--kind claude] (--prompt TEXT | --prompt-file FILE)
+      Launch a child of a running, named parent agent: workspace layout (the default) opens it as a tab in the
+      parent's workspace labelled "<n> <KEY> <topic>"; shared layout splits the parent's pane. Starts and prompts it as
+      launch does, and writes its record (~/.cache/herdr/agents/CHILD.json).
+  herdr_tools.py next-child-name --parent PARENT --slug SLUG
+      The next child name for a running, named parent: <parent>-<n>-<slug>, n counting up per parent, cut to fit.
+  herdr_tools.py open-parent --name AGENT --label LABEL --cwd DIR --shared-label SHARED [--kind claude]
+                             (--prompt TEXT | --prompt-file FILE)
+      Start a parent agent as a tab labelled LABEL in the shared workspace SHARED (created when missing), for the
+      shared layout. In the workspace layout a parent is whatever workspace it already runs in.
+  herdr_tools.py children PARENT [--json]
+      PARENT's recorded children: where each is (a tab, a pane in the parent's tab, its own workspace, gone), its
+      record state, pane state, status report state and age, and worktree.
+  herdr_tools.py pop-out CHILD | pop-in CHILD
+      Move a child to a workspace of its own, or back beside its parent by its record's layout, keeping its record.
+  herdr_tools.py collapse CHILD
+      Close a finished child's tab (or only its pane, when it shares a tab), keeping its record marked retired. Only
+      when the record is retired, or the child's report says merged with safe_to_retire: yes.
+  herdr_tools.py adopt AGENT --parent PARENT [--key KEY] [--topic TOPIC] [--layout workspace|shared]
+      Write a record for an agent spawned before records existed, so status groups it and consolidate can move it.
+  herdr_tools.py consolidate [--dry-run]
+      Move each live child that sits in a workspace other than its parent's back beside its parent, by its record's
+      layout. Herdr removes a workspace the move empties; one still holding panes is kept and listed. --dry-run only
+      prints the moves.
+  herdr_tools.py close-parent PARENT [--rehome]
+      Close a parent: its workspace when nothing else alive is in it, else (a shared workspace) only its tab. Refuses
+      while it has live children; --rehome first moves them to the "Orphaned agents" workspace and prints a notice for
+      the caller to relay to the owner.
   herdr_tools.py repo-launch --path REPO --key KEY [--branch BRANCH] [--timeout-seconds 120]
       Spawn through the repo's own launcher (its profile's spawn.command, with {key} and {branch} filled in) instead
       of launch, then wait for the agent it starts (spawn.agent). The launcher owns the worktree and the workspace;
@@ -31,7 +60,11 @@
       Create the briefs directory and print the file spawn writes AGENT's brief to.
   herdr_tools.py retire-info AGENT|WORKSPACE_ID|LABEL
       JSON for /herdr:retire: workspace, worktree, main checkout, branch, MR (the worktree branch's, else the one the
-      agent's status report names, in any repo), the agent's parsed status report, and every retire check.
+      agent's status report names, in any repo), the agent's parsed status report, how retire-close will close it
+      and what would block that, and every retire check. A recorded child's worktree comes from its record.
+  herdr_tools.py retire-close AGENT|WORKSPACE_ID|LABEL
+      The one way retire closes an agent: a recorded child's tab or pane (never the workspace it shares), its record
+      marked retired; any other agent's workspace only when no other agent or non-shell process is in it.
   herdr_tools.py land [AGENT|WORKSPACE_ID|LABEL] [--mr URL|GROUP/PROJECT!IID] [--timeout-minutes 30]
       Merge the agent's validated MR (its worktree branch's, else the one its status report names), or the MR --mr
       names in any repo: rebase if behind, wait for the head pipeline, squash-merge pinned to that commit. Stops on a
@@ -108,7 +141,10 @@ def find_parent_workspace(workspaces, repo_root, panes=()):
     return None
 
 
-def status_rows(workspaces, agents):
+def status_rows(workspaces, agents, records=()):
+    """Every agent, the ones needing attention first. A running child with a live or rehomed record follows its parent
+    (with `parent` set); one whose parent is not running stays in place, flagged `orphan`. Agents without records
+    keep exactly the rows they always had."""
     labels = {ws["workspace_id"]: ws.get("label", ws["workspace_id"]) for ws in workspaces}
     rows = [
         {
@@ -120,12 +156,34 @@ def status_rows(workspaces, agents):
         }
         for a in agents
     ]
-    return sorted(rows, key=lambda r: (ATTENTION_ORDER.get(r["status"], 9), r["workspace"].lower()))
+    rows = sorted(rows, key=lambda r: (ATTENTION_ORDER.get(r["status"], 9), r["workspace"].lower()))
+    names = {r["target"] for r in rows}
+    parents = {r["child"]: r.get("parent") for r in records
+               if r.get("state") in ("live", "rehomed") and r.get("child") in names}
+    if not parents:
+        return rows
+    grouped = []
+
+    def add(row, depth):
+        grouped.append(row)
+        for child in [r for r in rows if parents.get(r["target"]) == row["target"]]:
+            add(dict(child, parent=row["target"], depth=depth + 1), depth + 1)
+
+    for row in rows:
+        parent = parents.get(row["target"])
+        if parent is None:
+            add(row, 0)
+        elif parent not in names:
+            add(dict(row, parent=parent, orphan=True), 0)
+    return grouped
 
 
 def format_status(rows):
     if not rows:
         return "No agents are running."
+    rows = [dict(r, target="  " * r.get("depth", 0) + r["target"],
+                 title=("orphan of %s: %s" % (r["parent"], r["title"])) if r.get("orphan") else r["title"])
+            for r in rows]
     cols = [("STATUS", "status"), ("AGENT", "target"), ("KIND", "kind"), ("WORKSPACE", "workspace"), ("TITLE", "title")]
     widths = [max(len(head), *(len(r[key]) for r in rows)) for head, key in cols[:-1]]
     def line(values):
@@ -152,6 +210,81 @@ def status_report_path(agent, home=None):
 def brief_path(agent, home=None):
     """Where spawn writes an agent's brief: beside its status report, so a restart that clears a scratchpad keeps it."""
     return os.path.join(home or os.path.expanduser("~"), ".cache", "herdr", "briefs", agent + ".md")
+
+
+# ---- Child records: which agent a parent spawned, and where it sits ------------------------------------------------
+# One JSON file per child under ~/.cache/herdr/agents/, the only owner of this concept: Herdr keeps no durable per-pane
+# metadata and reports worktrees per workspace, never per tab or pane. Every reader goes through these functions.
+
+AGENT_NAME = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
+AGENT_NAME_MAX = 32
+RECORD_STATES = ("live", "retired", "rehomed")
+LAYOUTS = ("workspace", "shared")
+ORPHAN_WORKSPACE_LABEL = "Orphaned agents"
+
+
+def now_stamp():
+    return time.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def agent_record_path(child, home=None):
+    return os.path.join(home or os.path.expanduser("~"), ".cache", "herdr", "agents", child + ".json")
+
+
+def read_record(child):
+    record = read_json_or_none(agent_record_path(child))
+    return record if isinstance(record, dict) else None
+
+
+def write_record(record):
+    path = agent_record_path(record["child"])
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(record, handle, indent=2)
+    return record
+
+
+def update_record(child, event, now=None, **changes):
+    """Change a record's fields and append the event, with what it changed, to its history."""
+    record = read_record(child)
+    if record is None:
+        raise HerdrError("No record for %s in %s." % (child, os.path.dirname(agent_record_path(child))))
+    record.update(changes)
+    record.setdefault("history", []).append(dict({"at": now or now_stamp(), "event": event}, **changes))
+    return write_record(record)
+
+
+def list_records():
+    folder = os.path.dirname(agent_record_path("x"))
+    if not os.path.isdir(folder):
+        return []
+    records = [read_record(name[:-5]) for name in os.listdir(folder) if name.endswith(".json")]
+    return sorted((r for r in records if r and r.get("child")), key=lambda r: (r.get("parent", ""), r.get("n", 0)))
+
+
+def child_label(n, key, topic):
+    """A child's tab label (and its workspace label when popped out): `<n> <KEY> <topic>`."""
+    return "%d %s %s" % (n, key, topic)
+
+
+def next_child_n(parent, records):
+    return 1 + max([r.get("n", 0) for r in records if r.get("parent") == parent] or [0])
+
+
+def next_child_name(parent, slug, records):
+    """`<parent>-<n>-<slug>`, n counting up per parent, the slug cut so the whole is a Herdr agent name."""
+    if not AGENT_NAME.match(parent):
+        raise HerdrError("The parent %r must be a named agent (a name like irt-102, not a pane id), so its children's "
+                         "records survive pane renumbering." % parent)
+    slug = re.sub(r"[^a-z0-9_-]+", "-", slug.lower()).strip("-_")
+    if not slug:
+        raise HerdrError("The slug %r has no letters or digits to name the child by." % slug)
+    prefix = "%s-%d-" % (parent, next_child_n(parent, records))
+    room = AGENT_NAME_MAX - len(prefix)
+    if room < 1:
+        raise HerdrError("The parent name %r is too long to leave room for a child's number and slug (%d characters "
+                         "at most in all)." % (parent, AGENT_NAME_MAX))
+    return prefix + (slug[:room].rstrip("-_") or slug[0])
 
 
 def parse_status_report(text):
@@ -801,6 +934,63 @@ def find_retire_target(workspaces, agents, target, own_workspace):
     return ws
 
 
+def close_blockers(panes, agents, process_infos, keep):
+    """What `herdr workspace close` (or a tab close) would kill beyond the panes in KEEP: every other pane hosting an
+    agent, and every other pane whose foreground process is not its shell. An idle shell is not a blocker."""
+    by_pane = {a.get("pane_id"): a for a in agents}
+    blockers = []
+    for pane in panes:
+        pane_id = pane["pane_id"]
+        if pane_id in keep:
+            continue
+        agent = by_pane.get(pane_id)
+        if agent:
+            blockers.append("agent %s (%s) in %s" % (agent.get("name") or pane_id, agent.get("agent_status") or "unknown",
+                                                      pane_id))
+            continue
+        info = process_infos.get(pane_id) or {}
+        busy = [p for p in info.get("foreground_processes") or [] if p.get("pid") != info.get("shell_pid")]
+        if busy:
+            blockers.append("process `%s` in %s" % (busy[0].get("cmdline") or busy[0].get("name"), pane_id))
+    return blockers
+
+
+def same_path(a, b):
+    return bool(a) and bool(b) and os.path.normcase(os.path.realpath(a)) == os.path.normcase(os.path.realpath(b))
+
+
+def child_retire_target(record, agents, own_pane):
+    """A recorded child's retire target: Herdr reports worktrees per workspace, never per tab or pane, so the worktree
+    comes from the record, checked with git. Refuses the pane this session runs in, and a main checkout."""
+    agent = locate_record(record, agents)
+    if agent and agent.get("pane_id") == own_pane:
+        raise HerdrError("%s runs in this pane, the one this session runs in; retire it from another one."
+                         % record["child"])
+    path, main = record.get("worktree"), record.get("main_checkout")
+    if same_path(path, main):
+        raise HerdrError("%s's record names the repo's main checkout %s; only linked worktrees are retired."
+                         % (record["child"], path))
+    if path and os.path.isdir(path):
+        code, top = git(path, "rev-parse", "--show-toplevel")
+        if code != 0 or not same_path(top, path):
+            raise HerdrError("%s's record names the worktree %s, but git says %s. Check the record at %s."
+                             % (record["child"], path, top if code == 0 else "it is not a git checkout",
+                                agent_record_path(record["child"])))
+    return {"workspace_id": agent["workspace_id"] if agent else record.get("workspace_id"), "label": record.get("label"),
+            "worktree": {"checkout_path": path, "repo_root": main, "is_linked_worktree": True}}
+
+
+def retire_target(target, agents, workspace_list, own_workspace, own_pane):
+    """(workspace-like dict, record): a recorded child by its record; anything else as find_retire_target finds it. A
+    retired record whose name runs again (reused for an agent launched without --parent) no longer applies."""
+    record = read_record(target) if AGENT_NAME.match(target or "") else None
+    if record is not None and record.get("state") == "retired" and find_agent(target, agents) is not None:
+        record = None
+    if record is None:
+        return find_retire_target(workspace_list, agents, target, own_workspace), None
+    return child_retire_target(record, agents, own_pane), record
+
+
 # ---- herdr / git I/O ---------------------------------------------------------------------------------------------
 
 
@@ -1113,12 +1303,61 @@ def work_tools_path(plugins_dir=None, skill_folders=None):
     return None
 
 
+def find_target(target, agents):
+    """(workspace-like dict, record) for TARGET, refusing this session's own workspace or pane."""
+    return retire_target(target, agents, workspaces(), os.environ.get("HERDR_WORKSPACE_ID"),
+                         os.environ.get("HERDR_PANE_ID"))
+
+
+def target_agent(target, ws, record, agents):
+    """The agent being retired: the child a record names, the agent TARGET names, else the workspace's first agent."""
+    if record is not None:
+        return find_agent(record["child"], agents)
+    return find_agent(target, agents) or next((a for a in agents if a.get("workspace_id") == ws["workspace_id"]), None)
+
+
+def process_info(pane):
+    return herdr("pane", "process-info", "--pane", pane)["result"]["process_info"]
+
+
+def close_plan(target, agents=None):
+    """How retire closes TARGET, before anything closes: a child's tab or pane, or the agent's whole workspace, with
+    whatever else that workspace holds that the close would kill (the blockers)."""
+    agents = agent_list() if agents is None else agents
+    ws, record = find_target(target, agents)
+    if record is not None:
+        panes = herdr("pane", "list")["result"]["panes"]
+        pane = child_pane(record, agents, panes)
+        argv = close_child_command(pane, panes) if pane else None
+        return {"action": " ".join(argv[:2]) if argv else None, "target": argv[2] if argv else None, "blockers": [],
+                "record": record}
+    agent = target_agent(target, ws, None, agents)
+    keep = {agent["pane_id"]} if agent else set()
+    return {"action": "workspace close", "target": ws["workspace_id"], "label": ws.get("label"),
+            "blockers": scope_blockers(panes_in(ws["workspace_id"]), agents, keep), "record": None}
+
+
+def retire_close(target):
+    """The one way retire closes an agent: a recorded child's tab or pane (its record marked retired), never the
+    workspace it shares; any other agent's workspace only when nothing else alive is in it."""
+    agents = agent_list()
+    plan = close_plan(target, agents)
+    if plan["record"] is not None:
+        return close_child(plan["record"], "retire", agents)
+    if plan["blockers"]:
+        raise HerdrError("Not closing workspace %r (%s): it holds other live agents or processes, which `herdr "
+                         "workspace close` would kill:\n%s" % (plan.get("label"), plan["target"],
+                                                                "\n".join("- " + b for b in plan["blockers"])))
+    herdr("workspace", "close", plan["target"], parse=False)
+    return {"agent": target, "closed": "workspace close " + plan["target"]}
+
+
 def retire_info(target):
     """Everything /herdr:retire needs to decide, as one JSON-ready dict."""
     agents = herdr("agent", "list")["result"]["agents"]
-    ws = find_retire_target(workspaces(), agents, target, os.environ.get("HERDR_WORKSPACE_ID"))
+    ws, record = find_target(target, agents)
     path = ws["worktree"]["checkout_path"]
-    agent = next((a for a in agents if a.get("workspace_id") == ws["workspace_id"]), None)
+    agent = target_agent(target, ws, record, agents)
     name = agent.get("name") if agent else None
     report_path, report = read_report(name)
     reported_branch = report["fields"].get("branch", "") if report else ""
@@ -1149,6 +1388,16 @@ def retire_info(target):
                 git(main_checkout, "fetch", "-q", "origin", merged)
             branch_patch, merged_patch = branch_patch_id(path, default), commit_patch_id(path, merged)
         head_landed = head_landed_how(head, (mr or {}).get("sha"), on_default, branch_patch, merged_patch)
+    close = dict(close_plan(target, agents), record=agent_record_path(record["child"]) if record else None)
+    checks = retire_checks(
+        agent.get("agent_status", "unknown") if agent else "gone",
+        porcelain, mr["state"] if mr else None, head_landed, report, worktree_removed=removed, approval=approval,
+        land_mode=profile["retire"]["land"], report_expected=profile["spawn"]["brief"],
+    )
+    checks.append({"check": "close", "ok": not close["blockers"], "detail": (
+        "%s %s" % (close["action"], close["target"]) if close["action"] else "nothing left to close"
+    ) if not close["blockers"] else "the workspace holds other live agents or processes:\n" + "\n".join(
+        close["blockers"])})
     return {
         "profile": profile["name"] or "(defaults)",
         "forge": profile["forge"],
@@ -1169,11 +1418,9 @@ def retire_info(target):
         "branch_cleanup": profile["retire"]["branch_cleanup"],
         "worktree_remove": profile["worktree"].get("remove"),
         "work_tools": work_tools_path(),
-        "checks": retire_checks(
-            agent.get("agent_status", "unknown") if agent else "gone",
-            porcelain, mr["state"] if mr else None, head_landed, report, worktree_removed=removed, approval=approval,
-            land_mode=profile["retire"]["land"], report_expected=profile["spawn"]["brief"],
-        ),
+        "parent": record.get("parent") if record else None,
+        "close": close,
+        "checks": checks,
     }
 
 
@@ -1215,8 +1462,7 @@ def land_loop(forge, iid, timeout_seconds, poll_seconds=20, sleep=time.sleep, ma
 
 def agent_profile(target):
     """The resolved profile of the repo an agent's worktree belongs to (the agent named as retire-info takes it)."""
-    agents = herdr("agent", "list")["result"]["agents"]
-    ws = find_retire_target(workspaces(), agents, target, os.environ.get("HERDR_WORKSPACE_ID"))
+    ws = find_target(target, agent_list())[0]
     path = ws["worktree"]["checkout_path"]
     return project_profile(repo_root(path) if os.path.isdir(path) else ws["worktree"]["repo_root"])
 
@@ -1531,6 +1777,12 @@ def launch(path, label, name, kind, prompt, sleep=time.sleep, busy_timeout_secon
     summary = {"workspace_id": opened["workspace"]["workspace_id"], "pane_id": pane, "agent": name, "label": label}
     if opened.get("already_open"):
         summary["note"] = "The worktree already had a workspace; reused it."
+    return start_and_prompt(name, kind, pane, prompt, summary, sleep, busy_timeout_seconds)
+
+
+def start_and_prompt(name, kind, pane, prompt, summary, sleep=time.sleep, busy_timeout_seconds=PANE_BUSY_TIMEOUT):
+    """Start the agent in PANE; at a folder-trust prompt save the prompt for send-prompt, otherwise send it and confirm
+    the agent started working. Returns SUMMARY with the outcome added."""
     start_error = None
     try:
         start_agent(name, kind, pane, sleep, busy_timeout_seconds)
@@ -1556,6 +1808,404 @@ def launch(path, label, name, kind, prompt, sleep=time.sleep, busy_timeout_secon
     return summary
 
 
+def agent_list():
+    return herdr("agent", "list")["result"]["agents"]
+
+
+def find_agent(name, agents):
+    return next((a for a in agents if a.get("name") == name), None)
+
+
+def locate_record(record, agents=None):
+    """The agent a record names, found by name (pane ids change when a pane moves to another workspace); its new ids
+    are saved to the record. None when no agent has that name: nothing acts on a recorded id that may be stale."""
+    agent = find_agent(record["child"], agent_list() if agents is None else agents)
+    if agent is None:
+        return None
+    where = {key: agent.get(key) for key in ("workspace_id", "tab_id", "pane_id")}
+    if any(record.get(key) != value for key, value in where.items()):
+        record.update(update_record(record["child"], "located", **where))
+    return agent
+
+
+def child_pane_command(layout, parent_agent, path, label):
+    """The herdr call that opens a child's pane: a labelled tab in the parent's workspace, or a split of its pane."""
+    if layout == "workspace":
+        return ("tab", "create", "--workspace", parent_agent["workspace_id"], "--cwd", path, "--label", label,
+                "--no-focus")
+    if layout == "shared":
+        return ("pane", "split", parent_agent["pane_id"], "--direction", "right", "--cwd", path, "--no-focus")
+    raise HerdrError("The layout must be workspace or shared, not %r." % layout)
+
+
+def child_number(name, parent, records):
+    match = re.match(re.escape(parent) + r"-(\d+)-", name)
+    return int(match.group(1)) if match else next_child_n(parent, records)
+
+
+def launch_child(path, name, kind, prompt, parent, key, topic, layout="workspace", sleep=time.sleep,
+                 busy_timeout_seconds=PANE_BUSY_TIMEOUT):
+    """launch for a child of a running, named parent: open its pane by LAYOUT next to the parent, start the agent as
+    launch does, and write its record."""
+    if layout not in LAYOUTS:
+        raise HerdrError("The layout must be workspace or shared, not %r." % layout)
+    if not AGENT_NAME.match(name):
+        raise HerdrError("%r is not a Herdr agent name." % name)
+    existing = read_record(name)
+    if existing and existing.get("state") == "live":
+        raise HerdrError("%s already has a live record (%s); pick another name, or retire it first."
+                         % (name, agent_record_path(name)))
+    parent_agent = find_agent(parent, agent_list())
+    if parent_agent is None:
+        raise HerdrError("No agent named %r: --parent must be a running, named agent." % parent)
+    path = os.path.abspath(os.path.expanduser(path))
+    main = repo_root(path)
+    n = child_number(name, parent, list_records())
+    label = child_label(n, key, topic)
+    opened = herdr(*child_pane_command(layout, parent_agent, path, label))["result"]
+    pane = opened.get("root_pane") or opened["pane"]
+    record = {"child": name, "parent": parent, "n": n, "key": key, "label": label, "layout": layout,
+              "workspace_id": pane["workspace_id"], "tab_id": pane["tab_id"], "pane_id": pane["pane_id"],
+              "worktree": path, "branch": git(path, "branch", "--show-current")[1] or None, "main_checkout": main,
+              "spawned_at": now_stamp(), "state": "live", "history": []}
+    summary = {"workspace_id": pane["workspace_id"], "tab_id": pane["tab_id"], "pane_id": pane["pane_id"],
+               "agent": name, "label": label, "parent": parent, "layout": layout}
+    summary = start_and_prompt(name, kind, pane["pane_id"], prompt, summary, sleep, busy_timeout_seconds)
+    record["history"].append({"at": record["spawned_at"], "event": "spawned"})
+    write_record(record)
+    summary["record"] = agent_record_path(name)
+    return summary
+
+
+def need_record(child):
+    record = read_record(child)
+    if record is None:
+        raise HerdrError("No record for %s in %s; only children launched with --parent, or adopted, have one."
+                         % (child, os.path.dirname(agent_record_path(child))))
+    return record
+
+
+def child_where(record, agent, parent_agent):
+    """Where a child sits: as a tab or pane beside its parent, in its own workspace, or gone."""
+    if agent is None:
+        return "gone"
+    if parent_agent is None or agent.get("workspace_id") != parent_agent.get("workspace_id"):
+        return "own workspace"
+    if agent.get("tab_id") == parent_agent.get("tab_id"):
+        return "pane in the parent's tab"
+    return "tab " + record.get("label", "")
+
+
+def report_age_minutes(agent, now=None):
+    path = status_report_path(agent)
+    if not os.path.exists(path):
+        return None
+    return int(((now or time.time()) - os.path.getmtime(path)) // 60)
+
+
+def children(parent, now=None):
+    """Each recorded child of PARENT: where it is, its worktree, its pane state, and its status report's state and
+    age."""
+    agents = agent_list()
+    parent_agent = find_agent(parent, agents)
+    rows = []
+    for record in [r for r in list_records() if r.get("parent") == parent]:
+        agent = locate_record(record, agents)
+        report = read_report(record["child"])[1]
+        rows.append({"child": record["child"], "state": record.get("state"),
+                     "where": child_where(record, agent, parent_agent),
+                     "pane": agent.get("agent_status", "unknown") if agent else "gone",
+                     "report": report["fields"].get("state") if report else None,
+                     "report_age_minutes": report_age_minutes(record["child"], now),
+                     "worktree": record.get("worktree")})
+    return rows
+
+
+def format_children(rows):
+    if not rows:
+        return "No recorded children."
+    cols = [("CHILD", "child"), ("RECORD", "state"), ("WHERE", "where"), ("PANE", "pane"), ("REPORT", "report"),
+            ("AGE", "report_age_minutes"), ("WORKTREE", "worktree")]
+    def cell(row, key):
+        value = row[key]
+        return "-" if value is None else "%dm" % value if key == "report_age_minutes" else str(value)
+    table = [[head for head, _ in cols]] + [[cell(r, key) for _, key in cols] for r in rows]
+    widths = [max(len(line[i]) for line in table) for i in range(len(cols) - 1)]
+    return "\n".join("  ".join(v.ljust(w) for v, w in zip(line[:-1], widths)) + "  " + line[-1] for line in table)
+
+
+def located_child(child, agents=None):
+    """A child's record and its running agent; refuses one with no record or no running agent."""
+    record = need_record(child)
+    agent = locate_record(record, agents)
+    if agent is None:
+        raise HerdrError("%s is not running (no agent by that name in `herdr agent list`)." % child)
+    return record, agent
+
+
+def pop_in_command(record, agent, parent_agent):
+    """The move that puts a child back beside its parent: a new tab in the parent's workspace, or a split of the
+    parent's pane in its tab (Herdr needs both --tab and --target-pane for that)."""
+    if record.get("layout") == "shared":
+        return ("pane", "move", agent["pane_id"], "--tab", parent_agent["tab_id"], "--split", "right",
+                "--target-pane", parent_agent["pane_id"], "--no-focus")
+    return ("pane", "move", agent["pane_id"], "--new-tab", "--workspace", parent_agent["workspace_id"], "--label",
+            record.get("label", record["child"]), "--no-focus")
+
+
+def record_move(child, event, moved):
+    pane = moved["move_result"]["pane"]
+    return update_record(child, event, workspace_id=pane["workspace_id"], tab_id=pane["tab_id"],
+                         pane_id=pane["pane_id"])
+
+
+def pop_out(child):
+    """Move a child to a workspace of its own, labelled like its tab, keeping its record."""
+    agents = agent_list()
+    record, agent = located_child(child, agents)
+    parent_agent = find_agent(record.get("parent"), agents)
+    if parent_agent is None or agent["workspace_id"] != parent_agent["workspace_id"]:
+        raise HerdrError("%s is already in its own workspace; pop-in puts it back." % child)
+    moved = herdr("pane", "move", agent["pane_id"], "--new-workspace", "--label", record.get("label", child),
+                  "--no-focus")["result"]
+    return record_move(child, "pop-out", moved)
+
+
+def pop_in(child):
+    """Put a popped-out child back beside its parent, by its record's layout. Herdr removes the workspace it leaves
+    when nothing else is in it."""
+    agents = agent_list()
+    record, agent = located_child(child, agents)
+    parent_agent = find_agent(record.get("parent"), agents)
+    if parent_agent is None:
+        raise HerdrError("%s's parent %s is not running; there is nothing to pop in beside." % (child, record.get("parent")))
+    if agent["workspace_id"] == parent_agent["workspace_id"]:
+        raise HerdrError("%s is already beside its parent." % child)
+    return record_move(child, "pop-in", herdr(*pop_in_command(record, agent, parent_agent))["result"])
+
+
+def child_finished(record, report):
+    """A child may be collapsed once it is retired, or its report says merged with safe_to_retire: yes."""
+    fields = report["fields"] if report else {}
+    return record.get("state") == "retired" or (fields.get("state") == "merged" and fields.get("safe_to_retire") == "yes")
+
+
+def path_within(path, folder):
+    path, folder = os.path.normcase(os.path.normpath(path or "")), os.path.normcase(os.path.normpath(folder or ""))
+    try:
+        return bool(path) and bool(folder) and os.path.commonpath([path, folder]) == folder
+    except ValueError:  # different drives on Windows
+        return False
+
+
+def close_child_command(pane_id, panes):
+    """Close a child's tab when its pane is the only one in it, else just its pane: never anything wider."""
+    tab = next(p["tab_id"] for p in panes if p["pane_id"] == pane_id)
+    alone = [p["pane_id"] for p in panes if p["tab_id"] == tab] == [pane_id]
+    return ("tab", "close", tab) if alone else ("pane", "close", pane_id)
+
+
+def child_pane(record, agents, panes):
+    """The pane a child occupies: its agent's, found by name; else, for an agent that exited, its recorded pane only
+    while that pane still sits in the child's worktree and hosts no other agent. None when there is none."""
+    agent = locate_record(record, agents)
+    if agent is not None:
+        return agent["pane_id"]
+    pane = next((p for p in panes if p["pane_id"] == record.get("pane_id")), None)
+    hosted = {a.get("pane_id") for a in agents}
+    if pane and pane["pane_id"] not in hosted and path_within(pane.get("cwd"), record.get("worktree")):
+        return pane["pane_id"]
+    return None
+
+
+def close_child(record, event, agents=None):
+    """Close a child's tab or pane and mark its record retired. Refuses the pane this session runs in."""
+    agents = agent_list() if agents is None else agents
+    panes = herdr("pane", "list")["result"]["panes"]
+    pane = child_pane(record, agents, panes)
+    if pane is not None and pane == os.environ.get("HERDR_PANE_ID"):
+        raise HerdrError("%s runs in this pane; close it from another one." % record["child"])
+    argv = close_child_command(pane, panes) if pane is not None else None
+    if argv:
+        herdr(*argv, parse=False)
+    update_record(record["child"], event, state="retired")
+    return {"child": record["child"], "closed": " ".join(argv[:2]) + " " + argv[2] if argv else None}
+
+
+def collapse(child):
+    """Close a finished child's tab or pane, keeping its record (marked retired)."""
+    record = need_record(child)
+    report = read_report(child)[1]
+    if not child_finished(record, report):
+        fields = report["fields"] if report else {}
+        raise HerdrError("%s is not finished: its record is %s and its report says state %s, safe_to_retire %s. "
+                         "Collapse waits for a retired record, or a merged report with safe_to_retire: yes."
+                         % (child, record.get("state"), fields.get("state", "(none)"),
+                            fields.get("safe_to_retire", "(none)")))
+    return close_child(record, "collapse")
+
+
+def panes_in(workspace_id):
+    return herdr("pane", "list", "--workspace", workspace_id)["result"]["panes"]
+
+
+def scope_blockers(panes, agents, keep):
+    hosted = {a.get("pane_id") for a in agents}
+    infos = {p["pane_id"]: process_info(p["pane_id"]) for p in panes
+             if p["pane_id"] not in keep and p["pane_id"] not in hosted}
+    return close_blockers(panes, agents, infos, keep)
+
+
+def parent_close_command(parent_agent, panes, agents):
+    """Close a parent's workspace when nothing else alive is in it; in a shared workspace, only its tab; refuse when its
+    own tab holds anything else alive. Returns (argv, blockers)."""
+    keep = {parent_agent["pane_id"]}
+    if not scope_blockers(panes, agents, keep):
+        return ("workspace", "close", parent_agent["workspace_id"]), []
+    tab_blockers = scope_blockers([p for p in panes if p["tab_id"] == parent_agent["tab_id"]], agents, keep)
+    if tab_blockers:
+        return None, tab_blockers
+    return ("tab", "close", parent_agent["tab_id"]), []
+
+
+def rehome_children(records, agents):
+    """Move each child to the "Orphaned agents" workspace, a tab each (the first move creates the workspace), mark its
+    record rehomed, and return the notice for the caller to relay to the owner."""
+    orphans = next((w["workspace_id"] for w in workspaces() if w.get("label") == ORPHAN_WORKSPACE_LABEL), None)
+    for record in records:
+        agent = find_agent(record["child"], agents)
+        label = record.get("label", record["child"])
+        if orphans is None:
+            moved = herdr("pane", "move", agent["pane_id"], "--new-workspace", "--label", ORPHAN_WORKSPACE_LABEL,
+                          "--tab-label", label, "--no-focus")["result"]
+            orphans = moved["move_result"]["pane"]["workspace_id"]
+        else:
+            moved = herdr("pane", "move", agent["pane_id"], "--new-tab", "--workspace", orphans, "--label", label,
+                          "--no-focus")["result"]
+        pane = moved["move_result"]["pane"]
+        update_record(record["child"], "rehome", state="rehomed", workspace_id=pane["workspace_id"],
+                      tab_id=pane["tab_id"], pane_id=pane["pane_id"])
+    names = ", ".join(r["child"] for r in records)
+    return ("%s was closed with %d live child%s: %s. They now run in the %r workspace with no parent; each still needs "
+            "someone to answer its gates and retire it (/herdr:status flags them as orphans)."
+            % (records[0]["parent"], len(records), "" if len(records) == 1 else "ren", names, ORPHAN_WORKSPACE_LABEL))
+
+
+def close_parent(parent, rehome=False):
+    """Close a parent agent. Refuses while it has live children, unless REHOME moves them to the "Orphaned
+    agents" workspace first; never closes the pane this session runs in or anything else alive."""
+    agents = agent_list()
+    parent_agent = find_agent(parent, agents)
+    if parent_agent is None:
+        raise HerdrError("No agent named %r." % parent)
+    if parent_agent["pane_id"] == os.environ.get("HERDR_PANE_ID"):
+        raise HerdrError("%s runs in this pane, the one this session runs in; close it from another one." % parent)
+    live = [r for r in list_records() if r.get("parent") == parent and r.get("state") == "live"
+            and locate_record(r, agents) is not None]
+    notice = None
+    if live and not rehome:
+        raise HerdrError("%s has live children: %s. Retire or collapse them first, or pass --rehome to move them to the "
+                         "%r workspace." % (parent, ", ".join(r["child"] for r in live), ORPHAN_WORKSPACE_LABEL))
+    if live:
+        notice = rehome_children(live, agents)
+        agents = agent_list()
+        parent_agent = find_agent(parent, agents)
+    argv, blockers = parent_close_command(parent_agent, panes_in(parent_agent["workspace_id"]), agents)
+    if argv is None:
+        raise HerdrError("Not closing %s: its tab holds other live agents or processes:\n%s"
+                         % (parent, "\n".join("- " + b for b in blockers)))
+    herdr(*argv, parse=False)
+    return {"parent": parent, "closed": " ".join(argv), "rehomed": [r["child"] for r in live], "notice": notice}
+
+
+def adopt(parent, name, key=None, topic=None, layout="workspace"):
+    """Write a record for an agent spawned before records existed, so status groups it and consolidate can move it."""
+    if layout not in LAYOUTS:
+        raise HerdrError("The layout must be workspace or shared, not %r." % layout)
+    agents = agent_list()
+    agent = find_agent(name, agents)
+    if agent is None:
+        raise HerdrError("No agent named %r." % name)
+    if not AGENT_NAME.match(parent) or find_agent(parent, agents) is None:
+        raise HerdrError("No agent named %r: --parent must be a running, named agent." % parent)
+    existing = read_record(name)
+    if existing and existing.get("state") == "live":
+        raise HerdrError("%s already has a live record (%s)." % (name, agent_record_path(name)))
+    ws = next((w for w in workspaces() if w["workspace_id"] == agent.get("workspace_id")), {})
+    tree = ws.get("worktree") or {}
+    if tree.get("is_linked_worktree"):
+        worktree, main = tree["checkout_path"], tree["repo_root"]
+    else:
+        code, worktree = git(agent.get("cwd") or ".", "rev-parse", "--show-toplevel")
+        if code != 0:
+            raise HerdrError("%s's folder %s is not in a git checkout; nothing to record." % (name, agent.get("cwd")))
+        main = repo_root(worktree)
+    n = next_child_n(parent, list_records())
+    label = child_label(n, key, topic or ws.get("label", name)) if key else "%d %s" % (n, topic or ws.get("label", name))
+    stamp = now_stamp()
+    return write_record({
+        "child": name, "parent": parent, "n": n, "key": key, "label": label, "layout": layout,
+        "workspace_id": agent.get("workspace_id"), "tab_id": agent.get("tab_id"), "pane_id": agent.get("pane_id"),
+        "worktree": worktree, "branch": git(worktree, "branch", "--show-current")[1] or None, "main_checkout": main,
+        "spawned_at": stamp, "state": "live", "history": [{"at": stamp, "event": "adopted"}]})
+
+
+def consolidate(dry_run=False):
+    """Move each live child that sits outside its parent's workspace back beside it, by its record's layout. A
+    workspace a move empties is removed by Herdr; one still holding panes is kept and listed."""
+    agents = agent_list()
+    labels = {w["workspace_id"]: w.get("label", w["workspace_id"]) for w in workspaces()}
+    moves, skipped = [], []
+    for record in [r for r in list_records() if r.get("state") == "live"]:
+        agent = locate_record(record, agents)
+        parent_agent = find_agent(record.get("parent"), agents)
+        if agent is None or parent_agent is None:
+            skipped.append({"child": record["child"], "reason": "not running" if agent is None else
+                            "its parent %s is not running" % record.get("parent")})
+            continue
+        if agent["workspace_id"] == parent_agent["workspace_id"]:
+            continue
+        moves.append({"child": record["child"], "parent": record["parent"], "from": labels.get(agent["workspace_id"]),
+                      "from_id": agent["workspace_id"], "command": list(pop_in_command(record, agent, parent_agent))})
+    if dry_run:
+        return {"dry_run": True, "moves": [{k: v for k, v in m.items() if k != "from_id"} for m in moves],
+                "skipped": skipped}
+    for move in moves:
+        record_move(move["child"], "consolidate", herdr(*move["command"])["result"])
+    listed = {w["workspace_id"]: w for w in workspaces()}
+    results = []
+    for move in moves:
+        ws = listed.get(move["from_id"])
+        if ws is None:
+            result = "removed by Herdr (empty)"
+        elif not ws.get("pane_count"):
+            herdr("workspace", "close", move["from_id"], parse=False)
+            result = "closed (no panes left)"
+        else:
+            result = "kept: it still holds %d pane%s" % (ws["pane_count"], "" if ws["pane_count"] == 1 else "s")
+        results.append({"workspace": move["from"], "result": result})
+    return {"dry_run": False, "moves": [{k: v for k, v in m.items() if k != "from_id"} for m in moves],
+            "skipped": skipped, "workspaces": results}
+
+
+def open_parent(name, label, cwd, shared_label, kind, prompt, sleep=time.sleep,
+                busy_timeout_seconds=PANE_BUSY_TIMEOUT):
+    """Start a parent agent as a tab labelled LABEL in the shared workspace SHARED_LABEL, creating the workspace (and
+    using its first tab) when there is none."""
+    cwd = os.path.abspath(os.path.expanduser(cwd))
+    ws = next((w for w in workspaces() if w.get("label") == shared_label), None)
+    if ws is None:
+        opened = herdr("workspace", "create", "--cwd", cwd, "--label", shared_label, "--no-focus")["result"]
+        herdr("tab", "rename", opened["tab"]["tab_id"], label, parse=False)
+    else:
+        opened = herdr("tab", "create", "--workspace", ws["workspace_id"], "--cwd", cwd, "--label", label,
+                       "--no-focus")["result"]
+    pane = opened["root_pane"]
+    summary = {"workspace_id": pane["workspace_id"], "tab_id": pane["tab_id"], "pane_id": pane["pane_id"],
+               "agent": name, "label": label, "shared_label": shared_label}
+    return start_and_prompt(name, kind, pane["pane_id"], prompt, summary, sleep, busy_timeout_seconds)
+
+
 REPO_LAUNCH_TIMEOUT = 120
 REPO_LAUNCH_KEY = re.compile(r"^[A-Za-z0-9#][A-Za-z0-9._/#-]*$")
 
@@ -1575,7 +2225,7 @@ def repo_launch(main_checkout, profile, values, runner=subprocess.run, sleep=tim
                          "or '#', starting with a letter, digit or '#' (so it can't read as an option)." % key)
     argv = fill_command(spawn["command"], values)
     name = PLACEHOLDER.sub(lambda m: str(values.get(m.group(1), m.group(0))), spawn["agent"])
-    if not re.match(r"^[a-z][a-z0-9_-]{0,31}$", name):
+    if not AGENT_NAME.match(name):
         raise HerdrError("spawn.agent resolved to %r, which is not a Herdr agent name." % name)
     try:
         proc = runner(argv, capture_output=True, text=True, cwd=main_checkout, timeout=launcher_timeout_seconds)
@@ -1989,6 +2639,13 @@ def install_skills_command(args):
                           dry_run=args.dry_run)
 
 
+def read_prompt(args):
+    if args.prompt is not None:
+        return args.prompt
+    with open(args.prompt_file) as handle:
+        return handle.read().strip()
+
+
 # ---- CLI -----------------------------------------------------------------------------------------------------------
 
 
@@ -2002,12 +2659,46 @@ def main(argv=None):
     pw.add_argument("--wait-seconds", type=float, default=PARENT_WAIT_SECONDS)
     ln = sub.add_parser("launch")
     ln.add_argument("--path", required=True)
-    ln.add_argument("--label", required=True)
+    ln.add_argument("--label", help="the workspace label; not with --parent, whose child's tab label is built")
     ln.add_argument("--name", required=True)
     ln.add_argument("--kind", default="claude")
+    ln.add_argument("--parent", help="a running, named agent; the child opens next to it and gets a record")
+    ln.add_argument("--layout", choices=LAYOUTS, default="workspace")
+    ln.add_argument("--key")
+    ln.add_argument("--topic")
     group = ln.add_mutually_exclusive_group(required=True)
     group.add_argument("--prompt")
     group.add_argument("--prompt-file")
+    nc = sub.add_parser("next-child-name")
+    nc.add_argument("--parent", required=True)
+    nc.add_argument("--slug", required=True)
+    ch = sub.add_parser("children")
+    ch.add_argument("parent")
+    ch.add_argument("--json", action="store_true")
+    for name in ("pop-out", "pop-in", "collapse"):
+        sub.add_parser(name).add_argument("child")
+    sub.add_parser("retire-close").add_argument("child", metavar="AGENT|WORKSPACE_ID|LABEL")
+    cp = sub.add_parser("close-parent")
+    cp.add_argument("parent")
+    cp.add_argument("--rehome", action="store_true", help="move live children to the %r workspace first"
+                    % ORPHAN_WORKSPACE_LABEL)
+    ad = sub.add_parser("adopt")
+    ad.add_argument("child", metavar="AGENT")
+    ad.add_argument("--parent", required=True)
+    ad.add_argument("--key")
+    ad.add_argument("--topic")
+    ad.add_argument("--layout", choices=LAYOUTS, default="workspace")
+    co = sub.add_parser("consolidate")
+    co.add_argument("--dry-run", action="store_true")
+    op = sub.add_parser("open-parent")
+    op.add_argument("--name", required=True)
+    op.add_argument("--label", required=True)
+    op.add_argument("--cwd", required=True)
+    op.add_argument("--shared-label", required=True)
+    op.add_argument("--kind", default="claude")
+    op_group = op.add_mutually_exclusive_group(required=True)
+    op_group.add_argument("--prompt")
+    op_group.add_argument("--prompt-file")
     rl = sub.add_parser("repo-launch")
     rl.add_argument("--path", required=True)
     rl.add_argument("--key", required=True)
@@ -2088,14 +2779,39 @@ def main(argv=None):
         return 2
     try:
         if args.command == "status":
-            agents = herdr("agent", "list")["result"]["agents"]
-            print(format_status(status_rows(workspaces(), agents)))
+            print(format_status(status_rows(workspaces(), agent_list(), list_records())))
         elif args.command == "parent-workspace":
             ws = parent_workspace(args.path, args.create, args.wait_seconds)
             print(json.dumps({"workspace_id": ws["workspace_id"], "label": ws.get("label")}))
+        elif args.command == "launch" and args.parent:
+            if not (args.key and args.topic):
+                raise HerdrError("launch --parent needs --key and --topic for the child's tab label.")
+            print(json.dumps(launch_child(args.path, args.name, args.kind, read_prompt(args), args.parent, args.key,
+                                          args.topic, args.layout), indent=2))
         elif args.command == "launch":
-            prompt = args.prompt if args.prompt is not None else open(args.prompt_file).read().strip()
-            print(json.dumps(launch(args.path, args.label, args.name, args.kind, prompt), indent=2))
+            if not args.label:
+                raise HerdrError("launch needs --label (the workspace label) unless it has --parent.")
+            print(json.dumps(launch(args.path, args.label, args.name, args.kind, read_prompt(args)), indent=2))
+        elif args.command == "next-child-name":
+            if find_agent(args.parent, agent_list()) is None:
+                raise HerdrError("No agent named %r: --parent must be a running, named agent." % args.parent)
+            print(next_child_name(args.parent, args.slug, list_records()))
+        elif args.command == "children":
+            rows = children(args.parent)
+            print(json.dumps(rows, indent=2) if args.json else format_children(rows))
+        elif args.command in ("pop-out", "pop-in", "collapse", "retire-close"):
+            action = {"pop-out": pop_out, "pop-in": pop_in, "collapse": collapse,
+                      "retire-close": retire_close}[args.command]
+            print(json.dumps(action(args.child), indent=2))
+        elif args.command == "close-parent":
+            print(json.dumps(close_parent(args.parent, args.rehome), indent=2))
+        elif args.command == "adopt":
+            print(json.dumps(adopt(args.parent, args.child, args.key, args.topic, args.layout), indent=2))
+        elif args.command == "consolidate":
+            print(json.dumps(consolidate(args.dry_run), indent=2))
+        elif args.command == "open-parent":
+            print(json.dumps(open_parent(args.name, args.label, args.cwd, args.shared_label, args.kind,
+                                         read_prompt(args)), indent=2))
         elif args.command == "repo-launch":
             main = repo_root(args.path)
             print(json.dumps(repo_launch(main, project_profile(main), {"key": args.key, "branch": args.branch},
