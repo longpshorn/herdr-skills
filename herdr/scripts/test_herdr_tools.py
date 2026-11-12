@@ -1,4 +1,5 @@
 """Tests for herdr_tools: its pure logic, and its herdr flows against a stubbed `herdr`. Run: python3 -m unittest discover -s <this dir> -p 'test_*.py'"""
+import argparse
 import contextlib
 import datetime
 import hashlib
@@ -12,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 import herdr_tools as ht
 
@@ -2315,6 +2317,220 @@ class InstallSkillsCommand(unittest.TestCase):
         with self.assertRaises(ht.HerdrError) as caught:
             ht.pull_plugin(clone)
         self.assertIn("local changes", str(caught.exception))
+
+
+def git_in(cwd, *args):
+    subprocess.run(["git", "-C", cwd, "-c", "user.name=T", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false",
+                    "-c", "core.autocrlf=false", "-c", "core.hooksPath=", *args], check=True, capture_output=True)
+
+
+def mark_folder(folder, data):
+    os.makedirs(folder, exist_ok=True)
+    with open(os.path.join(folder, ht.SKILLS_MARKER), "w", encoding="utf-8") as handle:
+        json.dump(data, handle)
+
+
+class InstallSkillsHardening(unittest.TestCase):
+    """install-skills fails cleanly: it never writes or removes through a symlink, renders each copy beside its target
+    and renames it into place, and removes only folders both named herdr-* and marked for herdr."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp)
+        self.dest = os.path.join(self.tmp, "skills")
+        self.names = sorted("herdr-" + s for s in os.listdir(os.path.join(PLUGIN_ROOT, "skills")))
+
+    def install(self, dest=None):
+        return ht.install_skills(PLUGIN_ROOT, dest or self.dest, tool="agents", commit="abc123")
+
+    def symlink(self, target, link, directory=True):
+        try:
+            os.symlink(target, link, target_is_directory=directory)
+        except (OSError, NotImplementedError) as error:
+            self.skipTest("this OS won't create a symlink here: %s" % error)
+
+    def test_refuses_a_symlinked_copy_and_touches_nothing(self):
+        outside = os.path.join(self.tmp, "outside")
+        mark_folder(outside, {"plugin": "herdr", "skill": "spawn"})
+        os.makedirs(self.dest)
+        self.symlink(outside, os.path.join(self.dest, "herdr-spawn"))
+        for action in (self.install, lambda: ht.uninstall_skills(self.dest)):
+            with self.assertRaises(ht.HerdrError) as caught:
+                action()
+            self.assertIn("symlink", str(caught.exception))
+            self.assertIn("herdr-spawn", str(caught.exception))
+            self.assertEqual(os.listdir(self.dest), ["herdr-spawn"])
+            self.assertTrue(os.path.isfile(os.path.join(outside, ht.SKILLS_MARKER)))
+
+    def test_refuses_a_symlink_to_a_herdr_copy_under_another_name(self):
+        outside = os.path.join(self.tmp, "outside")
+        mark_folder(outside, {"plugin": "herdr", "skill": "spawn"})
+        os.makedirs(self.dest)
+        self.symlink(outside, os.path.join(self.dest, "linked"))
+        with self.assertRaises(ht.HerdrError) as caught:
+            ht.uninstall_skills(self.dest)
+        self.assertIn("linked", str(caught.exception))
+        self.assertTrue(os.path.isfile(os.path.join(outside, ht.SKILLS_MARKER)))
+
+    def test_other_symlinks_and_a_symlinked_skills_folder_are_fine(self):
+        real, unrelated = os.path.join(self.tmp, "real"), os.path.join(self.tmp, "unrelated")
+        os.makedirs(real)
+        os.makedirs(unrelated)
+        self.symlink(unrelated, os.path.join(real, "someone-else"))
+        linked = os.path.join(self.tmp, "linked")
+        self.symlink(real, linked)
+        self.install(linked)
+        self.assertIn("herdr-spawn", os.listdir(real))
+        ht.uninstall_skills(linked)
+        self.assertEqual(os.listdir(real), ["someone-else"])
+
+    def test_refuses_a_symlink_in_the_plugin_source(self):
+        root = os.path.join(self.tmp, "plugin")
+        os.makedirs(os.path.join(root, "skills", "x"))
+        with open(os.path.join(root, "skills", "x", "SKILL.md"), "w", encoding="utf-8") as handle:
+            handle.write("---\nname: x\n---\n# x\n")
+        secret = os.path.join(self.tmp, "secret.txt")
+        with open(secret, "w", encoding="utf-8") as handle:
+            handle.write("s")
+        self.symlink(secret, os.path.join(root, "skills", "x", "leak.txt"), directory=False)
+        with self.assertRaises(ht.HerdrError) as caught:
+            ht.install_skills(root, self.dest, tool="agents", commit="c")
+        self.assertIn("symlink", str(caught.exception))
+        self.assertFalse(os.path.exists(os.path.join(self.dest, "herdr-x")))
+
+    def test_a_folder_marked_herdr_but_not_named_herdr_is_never_removed(self):
+        other = os.path.join(self.dest, "spawn")
+        mark_folder(other, {"plugin": "herdr", "skill": "spawn"})
+        self.install()
+        self.assertEqual(sorted(ht.plugin_copies(self.dest, "herdr")), self.names)
+        ht.uninstall_skills(self.dest)
+        self.assertEqual(os.listdir(self.dest), ["spawn"])
+        self.assertTrue(os.path.isfile(os.path.join(other, ht.SKILLS_MARKER)))
+
+    def test_a_failed_render_leaves_the_old_copy_marked_and_no_temporary_folder(self):
+        self.install()
+        real = ht.render_skill
+
+        def broken(text, plugin, skill, root):
+            if skill == "spawn":
+                raise OSError("disk full")
+            return real(text, plugin, skill, root)
+
+        with mock.patch.object(ht, "render_skill", broken), self.assertRaises(OSError):
+            ht.install_skills(PLUGIN_ROOT, self.dest, tool="agents", commit="new")
+        self.assertEqual(sorted(os.listdir(self.dest)), self.names)
+        self.assertEqual(ht.skill_marker(os.path.join(self.dest, "herdr-spawn"))["commit"], "abc123")
+
+    def test_a_failed_swap_puts_the_old_copy_back(self):
+        self.install()
+        real, calls = os.rename, []
+
+        def rename(src, dst):
+            calls.append((src, dst))
+            if len(calls) == 2:
+                raise OSError("busy")
+            return real(src, dst)
+
+        with mock.patch.object(ht.os, "rename", rename), self.assertRaises(OSError):
+            self.install()
+        self.assertEqual(sorted(os.listdir(self.dest)), self.names)
+        self.assertEqual(ht.skill_marker(calls[0][0])["plugin"], "herdr")
+
+    def test_leftovers_of_an_interrupted_run_are_cleared_next_time(self):
+        self.install()
+        leftover = os.path.join(self.dest, ".herdr-spawn.tmp-abc")
+        mark_folder(leftover, {"plugin": "herdr", "skill": "spawn"})
+        foreign = os.path.join(self.dest, ".herdr-status.tmp-xyz")
+        os.makedirs(foreign)
+        result = self.install()
+        self.assertIn(".herdr-spawn.tmp-abc", result["removed"])
+        self.assertFalse(os.path.exists(leftover))
+        self.assertTrue(os.path.isdir(foreign))
+
+    def test_the_marker_is_lf(self):
+        self.install()
+        with open(os.path.join(self.dest, "herdr-spawn", ht.SKILLS_MARKER), "rb") as handle:
+            self.assertNotIn(b"\r\n", handle.read())
+
+
+class InstallSkillsFromAClone(unittest.TestCase):
+    """--update looks for copies before it pulls, fast-forwards a clean clone and re-renders with the pulled code; the
+    plugin root must be tracked by its clone."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, onerror=lambda f, p, e: (os.chmod(p, 0o700), f(p)))
+
+    def test_update_checks_for_copies_before_it_pulls(self):
+        args = argparse.Namespace(update=True, uninstall=False, dest=os.path.join(self.tmp, "empty"), tool=None,
+                                  no_pull=False, dry_run=False)
+        with mock.patch.object(ht, "pull_plugin", side_effect=AssertionError("pulled before checking for copies")):
+            with self.assertRaises(ht.HerdrError) as caught:
+                ht.install_skills_command(args)
+        self.assertIn("install them first", str(caught.exception))
+
+    def test_refuses_an_untracked_folder_inside_some_other_git_repo(self):
+        home = os.path.join(self.tmp, "home")
+        os.makedirs(home)
+        git_in(home, "init", "-q")
+        with open(os.path.join(home, "README"), "w", encoding="utf-8") as handle:
+            handle.write("dotfiles\n")
+        git_in(home, "add", "README")
+        git_in(home, "commit", "-q", "-m", "init")
+        cache = os.path.join(home, "cache", "herdr")
+        shutil.copytree(os.path.join(PLUGIN_ROOT, "skills"), os.path.join(cache, "skills"))
+        with self.assertRaises(ht.HerdrError) as caught:
+            ht.plugin_commit(cache)
+        self.assertIn("clone", str(caught.exception))
+
+    def plugin_clone(self):
+        """An upstream repo holding a copy of this plugin, and a clone of it: (upstream, the clone's plugin root)."""
+        upstream = os.path.join(self.tmp, "upstream")
+        ignore = shutil.ignore_patterns("__pycache__", "*.pyc", "node_modules", "examples")
+        shutil.copytree(PLUGIN_ROOT, os.path.join(upstream, "herdr"), ignore=ignore)
+        git_in(self.tmp, "init", "-q", upstream)
+        git_in(upstream, "add", "-A")
+        git_in(upstream, "commit", "-q", "-m", "init")
+        git_in(self.tmp, "clone", "-q", upstream, os.path.join(self.tmp, "clone"))
+        return upstream, os.path.join(self.tmp, "clone", "herdr")
+
+    def tools(self, root, *args):
+        env = dict(os.environ, PYTHONIOENCODING="utf-8")
+        env.pop("HERDR_ENV", None)
+        return subprocess.run([sys.executable, os.path.join(root, "scripts", "herdr_tools.py"), *args],
+                              capture_output=True, text=True, encoding="utf-8", env=env)
+
+    def test_pull_fast_forwards_a_clean_clone(self):
+        upstream, root = self.plugin_clone()
+        with open(os.path.join(upstream, "herdr", "NEW.md"), "w", encoding="utf-8") as handle:
+            handle.write("new\n")
+        git_in(upstream, "add", "-A")
+        git_in(upstream, "commit", "-q", "-m", "new")
+        ht.pull_plugin(root)
+        self.assertTrue(os.path.isfile(os.path.join(root, "NEW.md")))
+
+    def test_update_pulls_then_re_renders_with_the_pulled_code(self):
+        upstream, root = self.plugin_clone()
+        dest = os.path.join(self.tmp, "skills")
+        done = self.tools(root, "install-skills", "--dest", dest)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        extra = os.path.join(upstream, "herdr", "skills", "extra")
+        os.makedirs(extra)
+        with open(os.path.join(extra, "SKILL.md"), "w", encoding="utf-8") as handle:
+            handle.write("---\nname: extra\ndescription: d\n---\n\n# Extra\n\nRun `${CLAUDE_PLUGIN_ROOT}`.\n")
+        git_in(upstream, "add", "-A")
+        git_in(upstream, "commit", "-q", "-m", "extra")
+        head = ht.git(upstream, "rev-parse", "HEAD")[1]
+        done = self.tools(root, "install-skills", "--update", "--dest", dest)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        result = json.loads(done.stdout)
+        self.assertIsNotNone(result["pulled"])
+        self.assertIn("herdr-extra", result["refreshed"][0]["installed"])
+        self.assertEqual(ht.skill_marker(os.path.join(dest, "herdr-extra"))["commit"], head)
+        with open(os.path.join(dest, "herdr-extra", "SKILL.md"), encoding="utf-8") as handle:
+            text = handle.read()
+        self.assertIn("name: herdr-extra", text)
+        self.assertIn(root.replace("\\", "/"), text)
 
 
 class WorkToolsFromInstalledSkills(unittest.TestCase):
