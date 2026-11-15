@@ -55,7 +55,7 @@ Before you define any rule, threshold, mapping or list of values, search for an 
 
 ## Status report
 
-Keep a status report at `<status report path>` (outside the worktree, so it never shows in `git status`). Overwrite the whole file every time you stop and hand back to the owner: at the plan gate, when you ask them something, after opening the MR, after the pipeline result, and when you finish. Then print the same text as your last message. `/herdr:retire` reads this file to decide whether the session can close and to log its outcome, so keep it true and exact. When the owner gives a gate verdict, restate each item of it in the Summary. When you resume work after a gate verdict, first rewrite the report's header with `state: in-progress`.
+Keep a status report at `<status report path>` (outside the worktree, so it never shows in `git status`). Overwrite the whole file every time you stop and hand back to the owner: at the plan gate, when you ask them something, after opening the MR, after the pipeline result, and when you finish. Then print the same text as your last message. `/herdr:retire` reads this file to decide whether the session can close and to log its outcome, so keep it true and exact. When the owner gives a gate verdict, restate each item of it in the Summary. When you resume work after a gate verdict, first rewrite the report's header with `state: in-progress`. Start the report with the Problem: write it at the plan gate, so your plan leads with it, and keep it in every later report, updated if the owner's direction reframes the problem.
 
 Use this format. The header lines must stay `key: value`; write "None" in an empty section.
 
@@ -70,6 +70,9 @@ Use this format. The header lines must stay `key: value`; write "None" in an emp
     pipeline: passed | failed | running | none
     updated: <YYYY-MM-DD HH:MM>
     ---
+    ## Problem
+    <One to three lines, in your own words: the core problem you are solving and why it matters, not the planned changes.>
+
     ## Summary
     <Two or three lines: what this session achieved.>
 

@@ -313,6 +313,11 @@ def next_child_name(parent, slug, records):
     return prefix + (slug[:room].rstrip("-_") or slug[0])
 
 
+# The status report's sections, in order. The format they belong to lives in skills/spawn/references/brief-template.md.
+PROBLEM, SUMMARY, CHANGED, OPEN_QUESTIONS, FOLLOW_UPS = "Problem", "Summary", "Changed", "Open questions", "Follow-ups"
+REPORT_SECTIONS = (PROBLEM, SUMMARY, CHANGED, OPEN_QUESTIONS, FOLLOW_UPS)
+
+
 def parse_status_report(text):
     """A report is a `---` header of `key: value` lines, then `## Section` blocks. None if the header is missing."""
     match = re.match(r"\A---\n(.*?)\n---\n?(.*)\Z", text, re.DOTALL)
@@ -349,9 +354,15 @@ def report_followups(report):
         return [i for i in items if i.rstrip(".").lower() != "none"]
 
     sections = report["sections"]
-    found = [{"kind": "follow-up", "text": t} for t in bullets(sections.get("Follow-ups"))]
-    found += [{"kind": "unverified", "text": t} for t in bullets(sections.get("Changed")) if "unverified" in t.lower()]
+    found = [{"kind": "follow-up", "text": t} for t in bullets(sections.get(FOLLOW_UPS))]
+    found += [{"kind": "unverified", "text": t} for t in bullets(sections.get(CHANGED)) if "unverified" in t.lower()]
     return found
+
+
+def no_open_questions(report):
+    """The report's Open questions section is empty or says None (a missing report has none either)."""
+    questions = report["sections"].get(OPEN_QUESTIONS, "") if report else ""
+    return questions.strip().rstrip(".").lower() in ("", "none")
 
 
 def report_ready(report):
@@ -359,9 +370,8 @@ def report_ready(report):
     if not report:
         return False
     fields, sections = report["fields"], report["sections"]
-    questions = sections.get("Open questions", "").strip().rstrip(".").lower()
     return (fields.get("state") == "mr-open" and fields.get("pipeline") == "passed"
-            and "ready to land" in sections.get("Summary", "").lower() and questions in ("", "none"))
+            and "ready to land" in sections.get(SUMMARY, "").lower() and no_open_questions(report))
 
 
 def approval_detail(approval):
@@ -401,8 +411,8 @@ def retire_checks(agent_status, porcelain, mr_state, head_landed, report, worktr
     wrote anyway still gates.
     """
     fields = report["fields"] if report else {}
-    questions = report["sections"].get("Open questions", "") if report else ""
-    open_questions = questions.strip().rstrip(".").lower() not in ("", "none")
+    questions = report["sections"].get(OPEN_QUESTIONS, "") if report else ""
+    open_questions = not no_open_questions(report)
 
     def check(name, ok, detail):
         return {"check": name, "ok": ok, "detail": detail}
