@@ -545,6 +545,9 @@ mr: https://gitlab.com/group/repo/-/merge_requests/7
 pipeline: passed
 updated: 2026-10-17 14:05
 ---
+## Problem
+Users cannot find the widget, so they file support tickets.
+
 ## Summary
 Built the feature.
 
@@ -557,6 +560,11 @@ None
 ## Follow-ups
 - File a ticket for the docs gap
 """
+
+
+def without_problem(report):
+    """The same report in the format written before the Problem section existed."""
+    return re.sub(r"## Problem\n.*?\n\n", "", report, count=1, flags=re.DOTALL)
 
 
 class StatusReportPath(unittest.TestCase):
@@ -643,6 +651,26 @@ class ParseStatusReport(unittest.TestCase):
     def test_tolerates_missing_sections(self):
         report = ht.parse_status_report("---\nstate: mr-open\n---\n## Summary\nHalf done.\n")
         self.assertEqual(report["sections"], {"Summary": "Half done."})
+
+    def test_reads_the_problem_section_first(self):
+        report = ht.parse_status_report(REPORT)
+        self.assertEqual(report["sections"]["Problem"], "Users cannot find the widget, so they file support tickets.")
+        self.assertEqual(list(report["sections"])[0], "Problem")
+
+    def test_reads_a_report_written_before_the_problem_section(self):
+        report = ht.parse_status_report(without_problem(REPORT))
+        self.assertNotIn("Problem", report["sections"])
+        self.assertEqual(report["sections"]["Summary"], "Built the feature.")
+        self.assertEqual(report["fields"], ht.parse_status_report(REPORT)["fields"])
+
+    def test_the_section_names_match_the_brief_template(self):
+        path = os.path.join(os.path.dirname(os.path.abspath(ht.__file__)), os.pardir, "skills", "spawn",
+                            "references", "brief-template.md")
+        with open(path, encoding="utf-8") as handle:
+            template = handle.read()
+        block = template[template.index("    ---\n    agent:"):]
+        self.assertEqual(tuple(re.findall(r"^    ## (.+)$", block, re.MULTILINE)), ht.REPORT_SECTIONS)
+        self.assertEqual(ht.REPORT_SECTIONS[0], ht.PROBLEM)
 
     def test_returns_none_without_a_header(self):
         self.assertIsNone(ht.parse_status_report("## Summary\nNo header here.\n"))
@@ -1067,6 +1095,9 @@ state: mr-open
 pipeline: passed
 safe_to_retire: no
 ---
+## Problem
+The banner hides the save button on small screens.
+
 ## Summary
 All done; ready to land.
 
@@ -1084,6 +1115,28 @@ class ReportReady(unittest.TestCase):
                        ("ready to land", "nearly there"), ("## Open questions\nNone", "## Open questions\nWhich colour?")):
             self.assertFalse(ht.report_ready(ht.parse_status_report(READY_REPORT.replace(*change))), change)
         self.assertFalse(ht.report_ready(None))
+
+    def test_a_report_without_a_problem_section_reads_the_same(self):
+        for text in (READY_REPORT, READY_REPORT.replace("## Open questions\nNone", "## Open questions\nWhich colour?")):
+            self.assertEqual(ht.report_ready(ht.parse_status_report(without_problem(text))),
+                             ht.report_ready(ht.parse_status_report(text)))
+        self.assertNotEqual(without_problem(READY_REPORT), READY_REPORT)
+
+
+class ReportsWithoutAProblemSection(unittest.TestCase):
+    """Reports already on disk predate the Problem section; retire, peek and status must read them unchanged."""
+
+    def test_followups_are_the_same(self):
+        old, new = (ht.parse_status_report(t) for t in (without_problem(REPORT), REPORT))
+        self.assertNotIn("Problem", old["sections"])
+        self.assertEqual(ht.report_followups(old), ht.report_followups(new))
+        self.assertEqual(len(ht.report_followups(new)), 1)
+
+    def test_retire_checks_are_the_same(self):
+        for text in (REPORT, REPORT.replace("## Open questions\nNone", "## Open questions\n- Keep the flag?")):
+            old, new = (ht.parse_status_report(t) for t in (without_problem(text), text))
+            self.assertEqual(ht.retire_checks("idle", "", "merged", "same commit", old),
+                             ht.retire_checks("idle", "", "merged", "same commit", new))
 
 
 class WatchLoop(unittest.TestCase):
