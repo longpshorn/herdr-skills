@@ -140,11 +140,17 @@ The plugin works on any repo, but much of what makes parallel agents safe lives 
 
 ## Development
 
-The skills are short; their deterministic parts live in `herdr/scripts/herdr_tools.py` (Python 3.9, no dependencies). CI runs its unit tests and the full example's tests on Linux, macOS and Windows. Linux is pinned to Ubuntu 24.04, because Python 3.9 has no Ubuntu 26.04 build:
+The skills are short; their deterministic parts live in `herdr/scripts/herdr_tools.py` (Python 3.9, no dependencies). CI runs its unit tests and the full example's tests on Linux, macOS and Windows, with the helper's tests under Python 3.9, installed with uv:
 
 ```bash
 python3 -m unittest discover -s herdr/scripts -p 'test_*.py'
 (cd herdr/examples/full && npm test)
+```
+
+Your `python3` may be newer than 3.9, so run the helper's tests under 3.9 too before you push. On a Mac, the Command Line Tools Python is 3.9 and needs no setup:
+
+```bash
+/usr/bin/python3 -m unittest discover -s herdr/scripts -p 'test_*.py'
 ```
 
 When a CI job is cancelled because no hosted runner picked it up (most often on macOS), `.github/workflows/retry-unacquired.yml` re-runs those jobs, at most twice. If any job in the run failed on a runner, it retries nothing, so a flaky failure stays visible. Its tests run in CI, or locally:
