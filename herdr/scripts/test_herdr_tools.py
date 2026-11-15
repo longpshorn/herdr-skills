@@ -571,6 +571,67 @@ class BriefPath(unittest.TestCase):
                          os.path.join("/home/p", ".cache", "herdr", "briefs", "res1.md"))
 
 
+PANE_ID = "w6X:p1"
+WINDOWS_INVALID = re.compile(r'[<>:"/\\|?*]')
+
+
+class AgentFileName(unittest.TestCase):
+    def test_a_name_is_its_own_file_name(self):
+        self.assertEqual(ht.agent_file_name("irt-102-1-dedupe"), "irt-102-1-dedupe")
+
+    def test_a_pane_id_becomes_a_readable_stable_name_valid_on_every_os(self):
+        name = ht.agent_file_name(PANE_ID)
+        self.assertNotRegex(name, WINDOWS_INVALID)
+        self.assertRegex(name, r"^_pane-w6x-p1-[0-9a-f]{8}$")
+        self.assertEqual(name, ht.agent_file_name(PANE_ID))
+
+    def test_pane_ids_differing_only_in_case_stay_apart_on_case_insensitive_disks(self):
+        self.assertNotEqual(ht.agent_file_name("w6X:p1").lower(), ht.agent_file_name("w6x:p1").lower())
+
+    def test_a_pane_ids_file_name_can_never_be_an_agent_name(self):
+        self.assertIsNone(ht.AGENT_NAME.match(ht.agent_file_name(PANE_ID)))
+
+
+class PaneIdPaths(unittest.TestCase):
+    """Every cache path built from an agent target, given a pane id: a component Windows accepts, the same each time."""
+
+    def setUp(self):
+        self.home = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.home)
+
+    def assert_safe_and_stable(self, build):
+        path = build()
+        component = os.path.relpath(path, os.path.join(self.home, ".cache", "herdr")).split(os.sep)[1]
+        self.assertNotRegex(component, WINDOWS_INVALID)
+        self.assertEqual(os.path.dirname(path), os.path.dirname(build()))
+
+    def test_status_report_path(self):
+        self.assert_safe_and_stable(lambda: ht.status_report_path(PANE_ID, home=self.home))
+
+    def test_brief_path(self):
+        self.assert_safe_and_stable(lambda: ht.brief_path(PANE_ID, home=self.home))
+
+    def test_pending_prompt_path(self):
+        self.assert_safe_and_stable(lambda: ht.pending_prompt_path(PANE_ID, home=self.home))
+
+    def test_message_path_creates_its_folder(self):
+        self.assert_safe_and_stable(lambda: ht.message_path(PANE_ID, "hello", NOW, home=self.home))
+        self.assertTrue(os.path.isdir(os.path.dirname(ht.message_path(PANE_ID, "hello", NOW, home=self.home))))
+
+    def test_named_agents_keep_their_paths(self):
+        self.assertEqual(ht.pending_prompt_path("res1", home="/home/p"),
+                         os.path.join("/home/p", ".cache", "herdr", "pending-prompt", "res1.txt"))
+        self.assertEqual(os.path.dirname(ht.message_path("res1", "x", NOW, home=self.home)),
+                         os.path.join(self.home, ".cache", "herdr", "messages", "res1"))
+
+    def test_a_child_record_refuses_a_pane_id(self):
+        with self.assertRaisesRegex(ht.HerdrError, r"named agent.*not a pane id"):
+            ht.agent_record_path(PANE_ID, home=self.home)
+
+    def test_a_pane_id_has_no_record(self):
+        self.assertIsNone(ht.read_record(PANE_ID))
+
+
 class ParseStatusReport(unittest.TestCase):
     def test_reads_the_header_fields_and_sections(self):
         report = ht.parse_status_report(REPORT)

@@ -47,10 +47,11 @@
       Finish a launch that stopped at the folder-trust prompt: wait until the person running the session answers it
       and the agent is idle, then send the prompt launch saved (or the one given) and confirm the agent started working.
   herdr_tools.py deliver --name AGENT (--text TEXT | --file FILE) --topic TOPIC [--from SENDER] [--timeout-seconds 300]
-      Send a message as a file plus one pointer line: write it to ~/.cache/herdr/messages/AGENT/, send "Message from
-      SENDER: read PATH (sha256 ...) and act on it.", then check the agent's transcript (Claude agents) that the line
-      arrived intact, the file was read and is unchanged. A pointer that never arrived is resent once, only to an idle
-      agent. Prints JSON; "verified" is yes, no or unverified (other agent kinds). Exits 1 when it is no.
+      Send a message as a file plus one pointer line: write it to ~/.cache/herdr/messages/AGENT/ (a pane id becomes a
+      file-safe folder name, _pane-...), send "Message from SENDER: read PATH (sha256 ...) and act on it.", then check
+      the agent's transcript (Claude agents) that the line arrived intact, the file was read and is unchanged. A
+      pointer that never arrived is resent once, only to an idle agent. Prints JSON; "verified" is yes, no or
+      unverified (other agent kinds). Exits 1 when it is no.
   herdr_tools.py wait --name AGENT --until STATES [--timeout-seconds 600]
       Wait until the agent reaches one of the comma-separated STATES. A blank, missing or unknown status means keep
       waiting. Exits 0 on a match, 2 on timeout, 3 when the agent is gone. A recorded child's state changes go to its
@@ -111,6 +112,7 @@ a Python 3.9+ as `python3`, `python` or `py -3`.
 """
 import argparse
 import fnmatch
+import hashlib
 import json
 import os
 import re
@@ -214,12 +216,12 @@ def repo_root_from_common_dir(common_dir):
 
 def status_report_path(agent, home=None):
     """Where a spawned agent keeps its status report: outside the worktree, so it survives removal and stays out of git."""
-    return os.path.join(home or os.path.expanduser("~"), ".cache", "herdr", "status", agent + ".md")
+    return os.path.join(home or os.path.expanduser("~"), ".cache", "herdr", "status", agent_file_name(agent) + ".md")
 
 
 def brief_path(agent, home=None):
     """Where spawn writes an agent's brief: beside its status report, so a restart that clears a scratchpad keeps it."""
-    return os.path.join(home or os.path.expanduser("~"), ".cache", "herdr", "briefs", agent + ".md")
+    return os.path.join(home or os.path.expanduser("~"), ".cache", "herdr", "briefs", agent_file_name(agent) + ".md")
 
 
 # ---- Child records: which agent a parent spawned, and where it sits ------------------------------------------------
@@ -233,15 +235,29 @@ LAYOUTS = ("workspace", "shared")
 ORPHAN_WORKSPACE_LABEL = "Orphaned agents"
 
 
+def agent_file_name(target):
+    """An agent target as a file or folder name valid on macOS, Linux and Windows: a name as itself, anything else (a
+    pane id like w6X:p1) as `_pane-w6x-p1-<8 hex>`. No name starts with `_`, and the hash of the exact target keeps
+    targets differing only in case apart on case-insensitive disks."""
+    if AGENT_NAME.match(target):
+        return target
+    readable = re.sub(r"[^a-z0-9]+", "-", target.lower()).strip("-")[:40].strip("-")
+    return "_pane-%s-%s" % (readable, hashlib.sha256(target.encode("utf-8")).hexdigest()[:8])
+
+
 def now_stamp():
     return time.strftime("%Y-%m-%dT%H:%M:%S")
 
 
 def agent_record_path(child, home=None):
+    if not AGENT_NAME.match(child):
+        raise HerdrError("Child records need a named agent, not a pane id or other target: %r." % child)
     return os.path.join(home or os.path.expanduser("~"), ".cache", "herdr", "agents", child + ".json")
 
 
 def read_record(child):
+    if not AGENT_NAME.match(child or ""):
+        return None
     record = read_json_or_none(agent_record_path(child))
     return record if isinstance(record, dict) else None
 
@@ -993,7 +1009,7 @@ def child_retire_target(record, agents, own_pane):
 def retire_target(target, agents, workspace_list, own_workspace, own_pane):
     """(workspace-like dict, record): a recorded child by its record; anything else as find_retire_target finds it. A
     retired record whose name runs again (reused for an agent launched without --parent) no longer applies."""
-    record = read_record(target) if AGENT_NAME.match(target or "") else None
+    record = read_record(target)
     if record is not None and record.get("state") == "retired" and find_agent(target, agents) is not None:
         record = None
     if record is None:
@@ -1718,9 +1734,10 @@ def prompt_and_confirm(name, prompt, sleep=time.sleep, timeout_seconds=30, poll_
     return status
 
 
-def pending_prompt_path(agent):
+def pending_prompt_path(agent, home=None):
     """Where launch keeps a prompt it could not send because the agent stopped at the folder-trust prompt."""
-    return os.path.join(os.path.expanduser("~"), ".cache", "herdr", "pending-prompt", agent + ".txt")
+    folder = os.path.join(home or os.path.expanduser("~"), ".cache", "herdr", "pending-prompt")
+    return os.path.join(folder, agent_file_name(agent) + ".txt")
 
 
 def send_prompt(name, prompt=None, timeout_seconds=600, poll_seconds=3, sleep=time.sleep):
@@ -2273,8 +2290,8 @@ def repo_launch(main_checkout, profile, values, runner=subprocess.run, sleep=tim
 
 def message_path(agent, topic, now, home=None):
     """A new file for a message to AGENT: ~/.cache/herdr/messages/<agent>/<YYYYMMDD-HHMMSS>-<topic>.md, never one that
-    already exists. Creates the folder."""
-    folder = os.path.join(home or os.path.expanduser("~"), ".cache", "herdr", "messages", agent)
+    already exists, <agent> as agent_file_name gives it. Creates the folder."""
+    folder = os.path.join(home or os.path.expanduser("~"), ".cache", "herdr", "messages", agent_file_name(agent))
     os.makedirs(folder, exist_ok=True)
     slug = re.sub(r"[^a-z0-9]+", "-", topic.lower()).strip("-")[:40].strip("-") or "message"
     base = "%s-%s" % (now.strftime("%Y%m%d-%H%M%S"), slug)
