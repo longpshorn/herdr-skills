@@ -11,15 +11,18 @@ jobs:
     strategy: &os-matrix
       fail-fast: false
       matrix:
-        # ubuntu-24.04, not ubuntu-latest: Python 3.9, the helper's floor, has no Ubuntu 26.04 build.
-        os: [ubuntu-24.04, macos-latest, windows-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      # Python 3.9, the helper's floor, from uv on every OS; the activated venv puts it first on PATH.
+      - uses: astral-sh/setup-uv@v10.3.3
         with:
           python-version: "3.9"
+          activate-environment: true
+      - name: Python under test
+        run: python -c "import sys; print(sys.version); assert sys.version_info[:2] == (3, 9), sys.version"
       - name: Unit tests for herdr_tools.py
         run: python -m unittest discover -s herdr/scripts -p 'test_*.py' -v
 
@@ -40,7 +43,7 @@ jobs:
 
   retry-workflow:
     # The retry workflow only runs on ubuntu, from main; this tests its retry step on every PR.
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
